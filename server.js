@@ -151,6 +151,12 @@ async function setupDatabase(){
     for(const[n,cl] of [['bug','#F87171'],['feature','#5B8AF0'],['design','#8B5CF6'],['backend','#FBBF24'],['frontend','#34D399'],['urgent','#F87171']])
       await c.query('INSERT IGNORE INTO tags(name,color) VALUES(?,?)',[n,cl]);
 
+    // ── Migrate existing tables if needed ──
+    // Add 'supervisor' to role ENUM if not already there
+    await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
+    // Ensure supervisor_permissions table exists (may be missing on older installs)
+    // Already handled above via CREATE TABLE IF NOT EXISTS
+
     c.release();
     console.log('✅ Database ready');
   }catch(e){ console.error('DB setup error:',e.message); }
