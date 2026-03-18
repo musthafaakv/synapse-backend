@@ -1,9 +1,9 @@
 require('dotenv').config();
-const express = require('express');
-const mysql   = require('mysql2/promise');
-const bcrypt  = require('bcrypt');
-const jwt     = require('jsonwebtoken');
-const cors    = require('cors');
+const express    = require('express');
+const mysql      = require('mysql2/promise');
+const bcrypt     = require('bcrypt');
+const jwt        = require('jsonwebtoken');
+const cors       = require('cors');
 const nodemailer = require('nodemailer');
 
 const app = express();
@@ -11,7 +11,7 @@ app.use(express.json());
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.options('*', cors());
 
-app.get('/', (req, res) => res.json({ status: 'Synapse API running OK' }));
+app.get('/',       (req, res) => res.json({ status: 'Synapse API running OK' }));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 const pool = mysql.createPool({
@@ -19,15 +19,131 @@ const pool = mysql.createPool({
   port:     parseInt(process.env.DB_PORT) || 3306,
   user:     process.env.DB_USER || 'root',
   password: process.env.DB_PASS || '',
-  database: process.env.DB_NAME || 'taskmanager',
+  database: process.env.DB_NAME || 'railway',
   waitForConnections: true,
   connectionLimit: 10,
   connectTimeout: 20000,
 });
 
-pool.getConnection()
-  .then(conn => { console.log('MySQL connected'); conn.release(); })
-  .catch(err  => console.error('MySQL error:', err.message));
+// ── Auto-create all tables on startup ────────────────────
+async function setupDatabase() {
+  try {
+    const conn = await pool.getConnection();
+    console.log('MySQL connected successfully');
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) NOT NULL UNIQUE,
+        email VARCHAR(100) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        full_name VARCHAR(100),
+        role ENUM('admin','member') DEFAULT 'member',
+        avatar_color VARCHAR(7) DEFAULT '#3B82F6',
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        status ENUM('todo','in_progress','review','done') DEFAULT 'todo',
+        priority ENUM('low','medium','high','urgent') DEFAULT 'medium',
+        creator_id INT NOT NULL,
+        assignee_id INT,
+        due_date DATE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (creator_id)  REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (assignee_id) REFERENCES users(id) ON DELETE SET NULL
+      )
+    `);
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS tags (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(50) NOT NULL UNIQUE,
+        color VARCHAR(7) DEFAULT '#6366F1'
+      )
+    `);
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS task_tags (
+        task_id INT NOT NULL,
+        tag_id  INT NOT NULL,
+        PRIMARY KEY (task_id, tag_id),
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (tag_id)  REFERENCES tags(id)  ON DELETE CASCADE
+      )
+    `);
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS task_mentions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        task_id INT NOT NULL,
+        mentioned_user_id INT NOT NULL,
+        mentioned_by_id   INT NOT NULL,
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (task_id)           REFERENCES tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (mentioned_user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (mentioned_by_id)   REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS smtp_config (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        host VARCHAR(255) NOT NULL,
+        port INT NOT NULL DEFAULT 587,
+        username VARCHAR(255) NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        encryption ENUM('none','ssl','tls') DEFAULT 'tls',
+        from_email VARCHAR(255),
+        from_name  VARCHAR(100),
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS activity_log (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT,
+        action VARCHAR(100) NOT NULL,
+        entity_type VARCHAR(50),
+        entity_id INT,
+        meta JSON,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+      )
+    `);
+
+    // Seed default admin user (password: Admin@1234)
+    const adminHash = await bcrypt.hash('Admin@1234', 10);
+    await conn.query(`
+      INSERT IGNORE INTO users (username, email, password_hash, full_name, role, avatar_color)
+      VALUES ('admin', 'admin@company.com', ?, 'System Admin', 'admin', '#7C5CFC')
+    `, [adminHash]);
+
+    // Seed default tags
+    const defaultTags = [
+      ['bug','#F87171'], ['feature','#5B8AF0'], ['design','#8B5CF6'],
+      ['backend','#FBBF24'], ['frontend','#34D399'], ['urgent','#F87171']
+    ];
+    for (const [name, color] of defaultTags) {
+      await conn.query('INSERT IGNORE INTO tags (name, color) VALUES (?,?)', [name, color]);
+    }
+
+    conn.release();
+    console.log('Database tables ready');
+  } catch (err) {
+    console.error('Database setup error:', err.message);
+  }
+}
 
 const JWT_SECRET = process.env.JWT_SECRET || 'synapse_secret_change_me';
 
@@ -51,7 +167,7 @@ const wrap = fn => (req, res, next) =>
     res.status(500).json({ error: err.message || 'Server error' });
   });
 
-// AUTH
+// ── AUTH ──────────────────────────────────────────────────
 app.post('/api/auth/login', wrap(async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
@@ -65,7 +181,7 @@ app.post('/api/auth/login', wrap(async (req, res) => {
   res.json({ token, user: { id: user.id, username: user.username, email: user.email, full_name: user.full_name, role: user.role, avatar_color: user.avatar_color } });
 }));
 
-// USERS
+// ── USERS ─────────────────────────────────────────────────
 app.get('/api/users', auth, wrap(async (req, res) => {
   const [rows] = await pool.query('SELECT id, username, email, full_name, role, avatar_color, is_active, created_at FROM users ORDER BY full_name');
   res.json(rows);
@@ -84,10 +200,10 @@ app.post('/api/users', auth, adminOnly, wrap(async (req, res) => {
 app.put('/api/users/:id', auth, adminOnly, wrap(async (req, res) => {
   const { email, full_name, role, is_active, password } = req.body;
   const updates = [], vals = [];
-  if (email     !== undefined) { updates.push('email=?');        vals.push(email); }
-  if (full_name !== undefined) { updates.push('full_name=?');    vals.push(full_name); }
-  if (role      !== undefined) { updates.push('role=?');         vals.push(role); }
-  if (is_active !== undefined) { updates.push('is_active=?');    vals.push(is_active ? 1 : 0); }
+  if (email     !== undefined) { updates.push('email=?');         vals.push(email); }
+  if (full_name !== undefined) { updates.push('full_name=?');     vals.push(full_name); }
+  if (role      !== undefined) { updates.push('role=?');          vals.push(role); }
+  if (is_active !== undefined) { updates.push('is_active=?');     vals.push(is_active ? 1 : 0); }
   if (password)                { updates.push('password_hash=?'); vals.push(await bcrypt.hash(password, 10)); }
   if (!updates.length) return res.status(400).json({ error: 'Nothing to update' });
   vals.push(req.params.id);
@@ -101,7 +217,7 @@ app.delete('/api/users/:id', auth, adminOnly, wrap(async (req, res) => {
   res.json({ success: true });
 }));
 
-// TASKS
+// ── TASKS ─────────────────────────────────────────────────
 app.get('/api/tasks', auth, wrap(async (req, res) => {
   const { status, assignee, tag } = req.query;
   let sql = `SELECT t.*, u1.username as creator_username, u1.full_name as creator_name, u1.avatar_color as creator_color, u2.username as assignee_username, u2.full_name as assignee_name, u2.avatar_color as assignee_color, GROUP_CONCAT(DISTINCT tg.name ORDER BY tg.name SEPARATOR ',') as tag_names, GROUP_CONCAT(DISTINCT tg.color ORDER BY tg.name SEPARATOR ',') as tag_colors FROM tasks t LEFT JOIN users u1 ON t.creator_id=u1.id LEFT JOIN users u2 ON t.assignee_id=u2.id LEFT JOIN task_tags tt ON t.id=tt.task_id LEFT JOIN tags tg ON tt.tag_id=tg.id WHERE 1=1`;
@@ -152,13 +268,13 @@ app.delete('/api/tasks/:id', auth, wrap(async (req, res) => {
   res.json({ success: true });
 }));
 
-// TAGS
+// ── TAGS ──────────────────────────────────────────────────
 app.get('/api/tags', auth, wrap(async (req, res) => {
   const [rows] = await pool.query('SELECT * FROM tags ORDER BY name');
   res.json(rows);
 }));
 
-// NOTIFICATIONS
+// ── NOTIFICATIONS ─────────────────────────────────────────
 app.get('/api/notifications', auth, wrap(async (req, res) => {
   const [rows] = await pool.query('SELECT tm.*, t.title as task_title, u.username as mentioned_by FROM task_mentions tm JOIN tasks t ON tm.task_id=t.id JOIN users u ON tm.mentioned_by_id=u.id WHERE tm.mentioned_user_id=? ORDER BY tm.created_at DESC LIMIT 20', [req.user.id]);
   res.json(rows);
@@ -169,7 +285,7 @@ app.put('/api/notifications/:id/read', auth, wrap(async (req, res) => {
   res.json({ success: true });
 }));
 
-// SMTP
+// ── SMTP ──────────────────────────────────────────────────
 app.get('/api/admin/smtp', auth, adminOnly, wrap(async (req, res) => {
   const [rows] = await pool.query('SELECT id, host, port, username, encryption, from_email, from_name FROM smtp_config LIMIT 1');
   res.json(rows[0] || {});
@@ -204,6 +320,7 @@ app.get('/api/admin/activity', auth, adminOnly, wrap(async (req, res) => {
   res.json(rows);
 }));
 
+// ── EMAIL HELPER ──────────────────────────────────────────
 async function sendMentionEmail(userId, mentionedBy, taskTitle, taskId) {
   const [smtpRows] = await pool.query('SELECT * FROM smtp_config LIMIT 1');
   if (!smtpRows.length) return;
@@ -216,5 +333,8 @@ async function sendMentionEmail(userId, mentionedBy, taskTitle, taskId) {
 
 app.use((err, req, res, next) => res.status(500).json({ error: 'Internal server error' }));
 
+// ── START ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, '0.0.0.0', () => console.log(`Synapse API running on port ${PORT}`));
+setupDatabase().then(() => {
+  app.listen(PORT, '0.0.0.0', () => console.log(`Synapse API running on port ${PORT}`));
+});
