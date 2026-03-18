@@ -14,7 +14,12 @@ const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use(cors({
+  origin: '*',
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+app.options('*', cors());
 
 // ── Database pool ─────────────────────────────────────────
 const pool = mysql.createPool({
