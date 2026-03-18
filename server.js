@@ -357,7 +357,10 @@ app.post('/api/tasks', auth, wrap(async(req,res)=>{
   const[r]=await pool.query('INSERT INTO tasks(title,description,status,priority,creator_id,due_date) VALUES(?,?,?,?,?,?)',
     [title,description||'',status||'todo',priority||'medium',req.user.id,due_date||null]);
   const taskId=r.insertId;
-  const aList=Array.isArray(assignee_ids)?assignee_ids.map(Number):[];
+  // Members can only assign to themselves; admins/supervisors can assign to anyone
+  const isMember=req.user.role==='member';
+  const rawList=Array.isArray(assignee_ids)?assignee_ids.map(Number):[];
+  const aList=isMember?[req.user.id]:rawList.length?rawList:[req.user.id];
   for(const uid of aList){try{await pool.query('INSERT IGNORE INTO task_assignees(task_id,user_id) VALUES(?,?)',[taskId,uid]);}catch{}}
   if(Array.isArray(tags)&&tags.length){
     for(const tn of tags){
@@ -387,6 +390,12 @@ app.post('/api/tasks', auth, wrap(async(req,res)=>{
     }
   }
   await pool.query('INSERT INTO task_history(task_id,changed_by_id,action,new_value) VALUES(?,?,?,?)',[taskId,req.user.id,'created',title]);
+  // Log initial assignment
+  if(aList.length){
+    const[aNames]=await pool.query('SELECT full_name FROM users WHERE id IN ('+aList.map(()=>'?').join(',')+')',aList);
+    const names=aNames.map(u=>u.full_name).join(', ');
+    await pool.query('INSERT INTO task_history(task_id,changed_by_id,action,field,new_value) VALUES(?,?,?,?,?)',[taskId,req.user.id,'assigned','assignees',names]);
+  }
   res.json({id:taskId});
 }));
 
@@ -413,11 +422,20 @@ app.put('/api/tasks/:id', auth, wrap(async(req,res)=>{
   }
   if(Array.isArray(assignee_ids)){
     const newList=assignee_ids.map(Number);
-    const[oldRows]=await pool.query('SELECT user_id FROM task_assignees WHERE task_id=?',[taskId]);
+    const[oldRows]=await pool.query('SELECT ta.user_id,u.full_name FROM task_assignees ta JOIN users u ON ta.user_id=u.id WHERE ta.task_id=?',[taskId]);
     const oldList=oldRows.map(r=>r.user_id);
     const newlyAdded=newList.filter(id=>!oldList.includes(id));
+    const removed=oldList.filter(id=>!newList.includes(id));
     await pool.query('DELETE FROM task_assignees WHERE task_id=?',[taskId]);
     for(const uid of newList){try{await pool.query('INSERT IGNORE INTO task_assignees(task_id,user_id) VALUES(?,?)',[taskId,uid]);}catch{}}
+    if(newlyAdded.length){
+      const[addedNames]=await pool.query('SELECT full_name FROM users WHERE id IN ('+newlyAdded.map(()=>'?').join(',')+')',newlyAdded);
+      await pool.query('INSERT INTO task_history(task_id,changed_by_id,action,field,new_value) VALUES(?,?,?,?,?)',[taskId,req.user.id,'assigned','assignees',addedNames.map(u=>u.full_name).join(', ')]);
+    }
+    if(removed.length){
+      const removedNames=oldRows.filter(r=>removed.includes(r.user_id)).map(r=>r.full_name);
+      await pool.query('INSERT INTO task_history(task_id,changed_by_id,action,field,old_value) VALUES(?,?,?,?,?)',[taskId,req.user.id,'unassigned','assignees',removedNames.join(', ')]);
+    }
     for(const uid of newlyAdded){
       if(uid!==req.user.id){
         try{
@@ -459,6 +477,90 @@ app.post('/api/tasks/:id/complete-reassign', auth, wrap(async(req,res)=>{
   }
   await pool.query('INSERT INTO task_history(task_id,changed_by_id,action,field,old_value,new_value) VALUES(?,?,?,?,?,?)',
     [taskId,userId,'status_changed','status',task.status,'done']);
+  if(newList.length){
+    const[completedNames]=await pool.query('SELECT full_name FROM users WHERE id IN ('+newList.map(()=>'?').join(',')+')',newList);
+    await pool.query('INSERT INTO task_history(task_id,changed_by_id,action,field,new_value) VALUES(?,?,?,?,?)',
+      [taskId,userId,'moved','assignees',completedNames.map(u=>u.full_name).join(', ')]);
+  }
+  res.json({success:true});
+}));
+
+/* ── Task History (all task members can view) ── */
+app.get('/api/tasks/:id/history', auth, wrap(async(req,res)=>{
+  const taskId=req.params.id;
+  const userId=req.user.id;
+  const isAdmin=req.user.role==='admin';
+  const isSupervisorAll=req.user.role==='supervisor'&&req.user.permissions?.can_view_all_tasks;
+  if(!isAdmin&&!isSupervisorAll){
+    // Verify user is creator or assignee
+    const[access]=await pool.query(
+      'SELECT id FROM tasks WHERE id=? AND (creator_id=? OR id IN (SELECT task_id FROM task_assignees WHERE user_id=?))',
+      [taskId,userId,userId]);
+    if(!access.length) return res.status(403).json({error:'Access denied'});
+  }
+  const[rows]=await pool.query(`
+    SELECT th.*,
+      u.full_name as actor_name, u.username as actor_username,
+      u.avatar_color as actor_color, u.role as actor_role
+    FROM task_history th
+    JOIN users u ON th.changed_by_id=u.id
+    WHERE th.task_id=?
+    ORDER BY th.created_at ASC`,[taskId]);
+  res.json(rows);
+}));
+
+/* ── Move To: any task member can reassign (move) without marking done ── */
+app.post('/api/tasks/:id/move-to', auth, wrap(async(req,res)=>{
+  const{new_assignee_ids,note}=req.body;
+  const taskId=req.params.id;
+  const userId=req.user.id;
+  const isAdmin=req.user.role==='admin';
+  const isSupervisor=req.user.role==='supervisor';
+
+  // Check access: must be creator, assignee, admin, or supervisor
+  const[access]=await pool.query(
+    'SELECT id FROM tasks WHERE id=? AND (creator_id=? OR id IN (SELECT task_id FROM task_assignees WHERE user_id=?))',
+    [taskId,userId,userId]);
+  if(!access.length&&!isAdmin&&!isSupervisor) return res.status(403).json({error:'Not a member of this task'});
+
+  const[taskRows]=await pool.query('SELECT * FROM tasks WHERE id=?',[taskId]);
+  if(!taskRows.length) return res.status(404).json({error:'Task not found'});
+  const task=taskRows[0];
+
+  // Get old assignees for logging
+  const[oldRows]=await pool.query('SELECT ta.user_id,u.full_name FROM task_assignees ta JOIN users u ON ta.user_id=u.id WHERE ta.task_id=?',[taskId]);
+  const oldNames=oldRows.map(r=>r.full_name).join(', ');
+
+  const newList=Array.isArray(new_assignee_ids)?new_assignee_ids.map(Number):[];
+  if(!newList.length) return res.status(400).json({error:'At least one assignee required'});
+
+  // Replace assignees
+  await pool.query('DELETE FROM task_assignees WHERE task_id=?',[taskId]);
+  for(const uid of newList){
+    try{await pool.query('INSERT IGNORE INTO task_assignees(task_id,user_id) VALUES(?,?)',[taskId,uid]);}catch{}
+  }
+
+  // Get new assignee names for log
+  const[newNames]=await pool.query('SELECT full_name FROM users WHERE id IN ('+newList.map(()=>'?').join(',')+')',newList);
+  const newNamesStr=newNames.map(u=>u.full_name).join(', ');
+
+  // Log the movement
+  await pool.query('INSERT INTO task_history(task_id,changed_by_id,action,field,old_value,new_value) VALUES(?,?,?,?,?,?)',
+    [taskId,userId,'moved','assignees',oldNames,newNamesStr]);
+  if(note){
+    await pool.query('INSERT INTO task_history(task_id,changed_by_id,action,new_value) VALUES(?,?,?,?)',
+      [taskId,userId,'note',note]);
+  }
+
+  // Notify new assignees
+  for(const uid of newList){
+    if(uid!==userId){
+      try{
+        await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,userId,'reassigned']);
+        sendEmail(uid,req.user.username,task.title,'reassigned').catch(()=>{});
+      }catch{}
+    }
+  }
   res.json({success:true});
 }));
 
