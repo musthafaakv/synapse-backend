@@ -591,7 +591,8 @@ app.get('/api/admin/attendance', auth, adminOrSupervisor, wrap(async(req,res)=>{
   const endDate=`${y}-${String(m).padStart(2,'0')}-${String(lastD).padStart(2,'0')}`;
   await ensureSundaysHolidays(startDate,endDate);
 
-  let sql=`SELECT a.*,u.full_name,u.username,u.avatar_color,ab.full_name as approver_name
+  let sql=`SELECT a.*,u.full_name,u.username,u.avatar_color,
+    ab.full_name as approver_name, ab.username as approver_username, ab.avatar_color as approver_avatar_color, ab.role as approver_role
     FROM attendance a JOIN users u ON a.user_id=u.id
     LEFT JOIN users ab ON a.approved_by=ab.id
     WHERE a.work_date BETWEEN ? AND ?`;
