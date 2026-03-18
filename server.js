@@ -450,16 +450,41 @@ app.get('/api/admin/attendance', auth, adminOnly, wrap(async(req,res)=>{
   res.json({records,holidays,userReports:Object.values(userReports),stats:totals[0],year:y,month:m});
 }));
 
+/* ── Helper: Convert any date string to MySQL DATETIME format ── */
+const toMySQLDatetime = (val) => {
+  if (!val) return null;
+  // Already in MySQL format YYYY-MM-DD HH:MM:SS
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(val)) return val;
+  // Convert ISO 8601 (2026-03-18T22:03:14.000Z or 2026-03-18T22:03) to MySQL format
+  const d = new Date(val);
+  if (isNaN(d.getTime())) return null;
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+};
+
 /* ── Admin: Approve / Edit attendance ── */
 app.put('/api/admin/attendance/:id', auth, adminOnly, wrap(async(req,res)=>{
   const{clock_in_status,approved_clock_in,approved_clock_out,admin_note}=req.body;
   const id=req.params.id;
+
+  // If approving without explicit times, pull original times from the record
+  let clockInVal = approved_clock_in;
+  let clockOutVal = approved_clock_out;
+
+  if(clock_in_status==='approved' && clockInVal===undefined){
+    const[rows]=await pool.query('SELECT clock_in,clock_out FROM attendance WHERE id=?',[id]);
+    if(rows.length){
+      clockInVal = rows[0].clock_in;
+      clockOutVal = rows[0].clock_out || null;
+    }
+  }
+
   const u=[],v=[];
   if(clock_in_status!==undefined){u.push('clock_in_status=?');v.push(clock_in_status);}
-  if(approved_clock_in!==undefined){u.push('approved_clock_in=?');v.push(approved_clock_in||null);}
-  if(approved_clock_out!==undefined){u.push('approved_clock_out=?');v.push(approved_clock_out||null);}
+  if(clockInVal!==undefined){u.push('approved_clock_in=?');v.push(toMySQLDatetime(clockInVal));}
+  if(clockOutVal!==undefined){u.push('approved_clock_out=?');v.push(toMySQLDatetime(clockOutVal));}
   if(admin_note!==undefined){u.push('admin_note=?');v.push(admin_note);}
-  // Set approver info when approving
+
   if(clock_in_status==='approved'||clock_in_status==='rejected'){
     u.push('approved_by=?');v.push(req.user.id);
     u.push('approved_at=NOW()');
@@ -474,9 +499,13 @@ app.put('/api/admin/attendance/:id', auth, adminOnly, wrap(async(req,res)=>{
 app.post('/api/admin/attendance/bulk-approve', auth, adminOnly, wrap(async(req,res)=>{
   const{ids}=req.body;
   if(!Array.isArray(ids)||!ids.length) return res.status(400).json({error:'No IDs provided'});
-  await pool.query(`UPDATE attendance SET clock_in_status='approved', approved_by=?, approved_at=NOW(),
-    approved_clock_in=COALESCE(approved_clock_in,clock_in),
-    approved_clock_out=COALESCE(approved_clock_out,clock_out)
+  // Use MySQL's own COALESCE so no ISO conversion needed — clock_in is already stored as DATETIME
+  await pool.query(`UPDATE attendance SET
+    clock_in_status='approved',
+    approved_by=?,
+    approved_at=NOW(),
+    approved_clock_in=COALESCE(approved_clock_in, clock_in),
+    approved_clock_out=COALESCE(approved_clock_out, clock_out)
     WHERE id IN (${ids.map(()=>'?').join(',')}) AND clock_in_status='pending'`,[req.user.id,...ids]);
   res.json({success:true});
 }));
