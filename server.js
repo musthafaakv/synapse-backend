@@ -415,7 +415,13 @@ app.get('/api/admin/attendance', auth, adminOnly, wrap(async(req,res)=>{
     WHERE a.work_date BETWEEN ? AND ?`;
   const params=[startDate,endDate];
   if(user_id){sql+=' AND a.user_id=?';params.push(user_id);}
-  if(status){sql+=' AND a.clock_in_status=?';params.push(status);}
+  if(status==='pending'){
+    sql+=" AND (a.clock_in_status='pending' OR a.clock_out_status='pending')";
+  } else if(status==='approved'){
+    sql+=" AND a.clock_in_status='approved'";
+  } else if(status==='rejected'){
+    sql+=" AND a.clock_in_status='rejected'";
+  }
   sql+=' ORDER BY a.work_date DESC, u.full_name';
 
   const[records]=await pool.query(sql,params);
@@ -453,9 +459,7 @@ app.get('/api/admin/attendance', auth, adminOnly, wrap(async(req,res)=>{
 /* ── Helper: Convert any date string to MySQL DATETIME format ── */
 const toMySQLDatetime = (val) => {
   if (!val) return null;
-  // Already in MySQL format YYYY-MM-DD HH:MM:SS
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(val)) return val;
-  // Convert ISO 8601 (2026-03-18T22:03:14.000Z or 2026-03-18T22:03) to MySQL format
   const d = new Date(val);
   if (isNaN(d.getTime())) return null;
   const pad = n => String(n).padStart(2,'0');
@@ -464,31 +468,59 @@ const toMySQLDatetime = (val) => {
 
 /* ── Admin: Approve / Edit attendance ── */
 app.put('/api/admin/attendance/:id', auth, adminOnly, wrap(async(req,res)=>{
-  const{clock_in_status,approved_clock_in,approved_clock_out,admin_note}=req.body;
+  const{clock_in_status, clock_out_status, approved_clock_in, approved_clock_out, admin_note}=req.body;
   const id=req.params.id;
 
-  // If approving without explicit times, pull original times from the record
-  let clockInVal = approved_clock_in;
-  let clockOutVal = approved_clock_out;
+  // Always fetch the original record so we can default to original times
+  const[rows]=await pool.query('SELECT * FROM attendance WHERE id=?',[id]);
+  if(!rows.length) return res.status(404).json({error:'Record not found'});
+  const rec = rows[0];
 
-  if(clock_in_status==='approved' && clockInVal===undefined){
-    const[rows]=await pool.query('SELECT clock_in,clock_out FROM attendance WHERE id=?',[id]);
-    if(rows.length){
-      clockInVal = rows[0].clock_in;
-      clockOutVal = rows[0].clock_out || null;
+  const u=[],v=[];
+
+  // ── Handle clock-in approval ──
+  if(clock_in_status!==undefined){
+    u.push('clock_in_status=?');
+    v.push(clock_in_status);
+    if(clock_in_status==='approved'){
+      // Use provided time or fall back to original clock_in
+      const cin = approved_clock_in !== undefined ? approved_clock_in : rec.clock_in;
+      u.push('approved_clock_in=?');
+      v.push(toMySQLDatetime(cin));
+      u.push('approved_by=?'); v.push(req.user.id);
+      u.push('approved_at=NOW()');
+    }
+    if(clock_in_status==='rejected'){
+      u.push('approved_by=?'); v.push(req.user.id);
+      u.push('approved_at=NOW()');
     }
   }
 
-  const u=[],v=[];
-  if(clock_in_status!==undefined){u.push('clock_in_status=?');v.push(clock_in_status);}
-  if(clockInVal!==undefined){u.push('approved_clock_in=?');v.push(toMySQLDatetime(clockInVal));}
-  if(clockOutVal!==undefined){u.push('approved_clock_out=?');v.push(toMySQLDatetime(clockOutVal));}
-  if(admin_note!==undefined){u.push('admin_note=?');v.push(admin_note);}
-
-  if(clock_in_status==='approved'||clock_in_status==='rejected'){
-    u.push('approved_by=?');v.push(req.user.id);
-    u.push('approved_at=NOW()');
+  // ── Handle clock-out approval (independent of clock-in) ──
+  if(clock_out_status!==undefined){
+    u.push('clock_out_status=?');
+    v.push(clock_out_status);
+    if(clock_out_status==='approved'){
+      // Use provided time or fall back to original clock_out
+      const cout = approved_clock_out !== undefined ? approved_clock_out : rec.clock_out;
+      u.push('approved_clock_out=?');
+      v.push(toMySQLDatetime(cout));
+      // Set approver if not already set
+      if(clock_in_status===undefined){
+        u.push('approved_by=?'); v.push(req.user.id);
+        u.push('approved_at=NOW()');
+      }
+    }
   }
+
+  // ── Allow manual time override regardless of status change ──
+  if(clock_in_status===undefined && clock_out_status===undefined){
+    if(approved_clock_in!==undefined){ u.push('approved_clock_in=?'); v.push(toMySQLDatetime(approved_clock_in)); }
+    if(approved_clock_out!==undefined){ u.push('approved_clock_out=?'); v.push(toMySQLDatetime(approved_clock_out)); }
+  }
+
+  if(admin_note!==undefined){ u.push('admin_note=?'); v.push(admin_note); }
+
   if(!u.length) return res.status(400).json({error:'Nothing to update'});
   v.push(id);
   await pool.query(`UPDATE attendance SET ${u.join(',')} WHERE id=?`,v);
