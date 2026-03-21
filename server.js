@@ -212,7 +212,28 @@ async function setupDatabase(){
       type ENUM('sunday','public','manual') DEFAULT 'manual',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
 
-    /* ── Migrations ── */
+    /* Leave Applications */
+    await c.query(`CREATE TABLE IF NOT EXISTS leave_applications(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      leave_type ENUM('medical','emergency','annual','half_day','others') NOT NULL,
+      start_date DATE NOT NULL,
+      end_date DATE NOT NULL,
+      half_day_period ENUM('morning','afternoon') DEFAULT NULL,
+      half_day_start TIME DEFAULT NULL,
+      half_day_end TIME DEFAULT NULL,
+      reason TEXT NOT NULL,
+      status ENUM('pending','approved','rejected') DEFAULT 'pending',
+      reviewed_by INT DEFAULT NULL,
+      reviewed_at TIMESTAMP NULL,
+      reviewer_note TEXT,
+      admin_override BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY(reviewed_by) REFERENCES users(id) ON DELETE SET NULL)`);
+
+    /* Migrations */
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN employee_category ENUM('office','field') DEFAULT 'office'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT ''`).catch(()=>{});
@@ -838,6 +859,163 @@ app.post('/api/admin/holidays', auth, adminOrSupervisor, wrap(async(req,res)=>{
 }));
 app.delete('/api/admin/holidays/:date', auth, adminOnly, wrap(async(req,res)=>{
   await pool.query('DELETE FROM holidays WHERE holiday_date=? AND type!=?',[req.params.date,'sunday']);
+  res.json({success:true});
+}));
+
+/* ══════════════════════════════════════
+   LEAVE APPLICATIONS
+══════════════════════════════════════ */
+
+// Leave type config — which types need a mandatory reason comment
+const LEAVE_CONFIG = {
+  medical:   { days_allowed: 12, requires_reason: false, label: 'Medical Leave' },
+  emergency: { days_allowed: 6,  requires_reason: true,  label: 'Emergency Leave' },
+  annual:    { days_allowed: 14, requires_reason: false,  label: 'Annual Leave' },
+  half_day:  { days_allowed: 99, requires_reason: true,  label: 'Half Day' },
+  others:    { days_allowed: 5,  requires_reason: true,  label: 'Other Leave' },
+};
+
+// Submit leave application (members + supervisors)
+app.post('/api/leave', auth, wrap(async(req,res)=>{
+  if(req.user.role==='admin') return res.status(403).json({error:'Administrators do not apply for leave. Use admin override.'});
+  const{leave_type,start_date,end_date,reason,half_day_period,half_day_start,half_day_end}=req.body;
+
+  if(!leave_type||!start_date||!end_date) return res.status(400).json({error:'Leave type and dates are required'});
+  if(!LEAVE_CONFIG[leave_type]) return res.status(400).json({error:'Invalid leave type'});
+
+  // Reason required for emergency, others, half_day
+  if(LEAVE_CONFIG[leave_type].requires_reason&&!reason?.trim())
+    return res.status(400).json({error:`A reason is required for ${LEAVE_CONFIG[leave_type].label}`});
+
+  // Half day requires period and times
+  if(leave_type==='half_day'){
+    if(!half_day_period) return res.status(400).json({error:'Please select Morning or Afternoon for half day'});
+    if(!half_day_start||!half_day_end) return res.status(400).json({error:'Start and end time required for half day leave'});
+    if(start_date!==end_date) return res.status(400).json({error:'Half day leave must be a single day'});
+  }
+
+  // Check for overlapping approved/pending leaves
+  const[overlap]=await pool.query(`
+    SELECT id FROM leave_applications
+    WHERE user_id=? AND status!='rejected'
+    AND NOT (end_date < ? OR start_date > ?)`,
+    [req.user.id, start_date, end_date]);
+  if(overlap.length) return res.status(400).json({error:'You already have a leave application covering this date range'});
+
+  const[r]=await pool.query(`INSERT INTO leave_applications
+    (user_id,leave_type,start_date,end_date,reason,half_day_period,half_day_start,half_day_end)
+    VALUES(?,?,?,?,?,?,?,?)`,
+    [req.user.id,leave_type,start_date,end_date,reason?.trim()||'',
+     half_day_period||null,half_day_start||null,half_day_end||null]);
+
+  res.json({success:true,id:r.insertId,message:'Leave application submitted — awaiting supervisor approval'});
+}));
+
+// My leave applications
+app.get('/api/leave/my', auth, wrap(async(req,res)=>{
+  const{year}=req.query;
+  const y=parseInt(year)||new Date().getFullYear();
+  const[rows]=await pool.query(`
+    SELECT la.*,u.full_name as reviewer_name,u.avatar_color as reviewer_color
+    FROM leave_applications la
+    LEFT JOIN users u ON la.reviewed_by=u.id
+    WHERE la.user_id=? AND YEAR(la.start_date)=?
+    ORDER BY la.created_at DESC`,[req.user.id,y]);
+
+  // Compute leave usage per type
+  const usage={};
+  for(const[type,cfg] of Object.entries(LEAVE_CONFIG)){
+    const used=rows.filter(r=>r.leave_type===type&&r.status==='approved')
+      .reduce((sum,r)=>{
+        if(r.leave_type==='half_day') return sum+0.5;
+        const d1=new Date(r.start_date),d2=new Date(r.end_date);
+        return sum+Math.round((d2-d1)/86400000)+1;
+      },0);
+    usage[type]={used,allowed:cfg.days_allowed,label:cfg.label};
+  }
+  res.json({applications:rows,usage,year:y});
+}));
+
+// Admin/Supervisor: all leave applications
+app.get('/api/admin/leave', auth, adminOrSupervisor, wrap(async(req,res)=>{
+  const{status,year,month,user_id}=req.query;
+  const y=parseInt(year)||new Date().getFullYear();
+  let sql=`SELECT la.*,
+    u.full_name,u.username,u.avatar_color,u.employee_category,u.department,
+    rv.full_name as reviewer_name,rv.avatar_color as reviewer_color,rv.role as reviewer_role
+    FROM leave_applications la
+    JOIN users u ON la.user_id=u.id
+    LEFT JOIN users rv ON la.reviewed_by=rv.id
+    WHERE YEAR(la.start_date)=?`;
+  const params=[y];
+  if(month){sql+=' AND MONTH(la.start_date)=?';params.push(parseInt(month));}
+  if(status){sql+=' AND la.status=?';params.push(status);}
+  if(user_id){sql+=' AND la.user_id=?';params.push(user_id);}
+  sql+=' ORDER BY la.created_at DESC';
+  const[rows]=await pool.query(sql,params);
+
+  // Leave type summary
+  const[summary]=await pool.query(`SELECT
+    leave_type,status,COUNT(*) as count
+    FROM leave_applications WHERE YEAR(start_date)=?
+    GROUP BY leave_type,status`,[y]);
+
+  res.json({applications:rows,summary,year:y});
+}));
+
+// Approve/reject leave — supervisors can approve; admins can also override
+app.put('/api/admin/leave/:id', auth, adminOrSupervisor, wrap(async(req,res)=>{
+  const{status,reviewer_note,admin_override}=req.body;
+  const id=req.params.id;
+  if(!['approved','rejected'].includes(status)) return res.status(400).json({error:'Invalid status'});
+
+  const[rows]=await pool.query('SELECT * FROM leave_applications WHERE id=?',[id]);
+  if(!rows.length) return res.status(404).json({error:'Application not found'});
+  const app_=rows[0];
+
+  // Supervisors cannot approve their own leave
+  if(req.user.role==='supervisor'&&app_.user_id===req.user.id)
+    return res.status(403).json({error:'You cannot approve your own leave application'});
+
+  await pool.query(`UPDATE leave_applications
+    SET status=?,reviewed_by=?,reviewed_at=NOW(),reviewer_note=?,admin_override=?
+    WHERE id=?`,
+    [status,req.user.id,reviewer_note||null,req.user.role==='admin'&&admin_override?1:0,id]);
+
+  // If approved, mark those attendance days as on-leave
+  if(status==='approved'){
+    const start=new Date(app_.start_date+'T12:00:00');
+    const end=new Date(app_.end_date+'T12:00:00');
+    for(let d=new Date(start);d<=end;d.setDate(d.getDate()+1)){
+      const ds=localDate(d);
+      // Update attendance record if it exists (mark leave)
+      await pool.query(`UPDATE attendance SET admin_note=CONCAT(COALESCE(admin_note,''),' [On Approved Leave]')
+        WHERE user_id=? AND work_date=?`,[app_.user_id,ds]).catch(()=>{});
+    }
+  }
+  res.json({success:true});
+}));
+
+// Admin: manual override — force-approve any pending leave
+app.post('/api/admin/leave/:id/override', auth, adminOnly, wrap(async(req,res)=>{
+  const{status,reviewer_note}=req.body;
+  const id=req.params.id;
+  if(!status) return res.status(400).json({error:'Status required'});
+  await pool.query(`UPDATE leave_applications SET status=?,reviewed_by=?,reviewed_at=NOW(),reviewer_note=?,admin_override=1 WHERE id=?`,
+    [status,req.user.id,reviewer_note||'Admin override',id]);
+  res.json({success:true});
+}));
+
+// Delete leave application (own pending only, or admin any)
+app.delete('/api/leave/:id', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM leave_applications WHERE id=?',[req.params.id]);
+  if(!rows.length) return res.status(404).json({error:'Not found'});
+  const rec=rows[0];
+  if(req.user.role!=='admin'){
+    if(rec.user_id!==req.user.id) return res.status(403).json({error:'Access denied'});
+    if(rec.status!=='pending') return res.status(400).json({error:'Can only withdraw pending applications'});
+  }
+  await pool.query('DELETE FROM leave_applications WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
 
