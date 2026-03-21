@@ -1,4 +1,10 @@
 require('dotenv').config();
+
+// Polyfill fetch for Node < 18
+if(!globalThis.fetch){
+  try{ globalThis.fetch = require('node-fetch'); }catch(e){ /* node-fetch not installed, fetch may fail */ }
+}
+
 const express    = require('express');
 const mysql      = require('mysql2/promise');
 const bcrypt     = require('bcrypt');
