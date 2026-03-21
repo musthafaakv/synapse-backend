@@ -161,13 +161,18 @@ async function setupDatabase(){
       FOREIGN KEY(tag_id)  REFERENCES tags(id)  ON DELETE CASCADE)`);
 
     await c.query(`CREATE TABLE IF NOT EXISTS notifications(
-      id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL,
-      task_id INT NOT NULL, triggered_by_id INT NOT NULL,
-      type VARCHAR(50) DEFAULT 'assigned', is_read BOOLEAN DEFAULT FALSE,
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      task_id INT DEFAULT NULL,
+      triggered_by_id INT DEFAULT NULL,
+      type VARCHAR(80) DEFAULT 'assigned',
+      title VARCHAR(255) DEFAULT NULL,
+      message TEXT DEFAULT NULL,
+      is_read BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
-      FOREIGN KEY(triggered_by_id) REFERENCES users(id) ON DELETE CASCADE)`);
+      FOREIGN KEY(triggered_by_id) REFERENCES users(id) ON DELETE SET NULL)`);
 
     await c.query(`CREATE TABLE IF NOT EXISTS task_history(
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -253,6 +258,10 @@ async function setupDatabase(){
     await c.query(`ALTER TABLE users ADD COLUMN employee_category ENUM('office','field') DEFAULT 'office'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP NULL`).catch(()=>{});
+    await c.query(`ALTER TABLE notifications MODIFY COLUMN task_id INT DEFAULT NULL`).catch(()=>{});
+    await c.query(`ALTER TABLE notifications MODIFY COLUMN triggered_by_id INT DEFAULT NULL`).catch(()=>{});
+    await c.query(`ALTER TABLE notifications ADD COLUMN title VARCHAR(255) DEFAULT NULL`).catch(()=>{});
+    await c.query(`ALTER TABLE notifications ADD COLUMN message TEXT DEFAULT NULL`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(64) DEFAULT NULL`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT ''`).catch(()=>{});
     await c.query(`ALTER TABLE notifications MODIFY COLUMN type VARCHAR(50) DEFAULT 'assigned'`).catch(()=>{});
@@ -604,7 +613,16 @@ app.get('/api/tasks/:id/history', auth, wrap(async(req,res)=>{
 ══════════════════════════════════════ */
 app.get('/api/tags', auth, wrap(async(req,res)=>{const[rows]=await pool.query('SELECT * FROM tags ORDER BY name');res.json(rows);}));
 app.get('/api/notifications', auth, wrap(async(req,res)=>{
-  const[rows]=await pool.query(`SELECT n.*,t.title as task_title,u.username as triggered_by,u.full_name as triggered_by_name FROM notifications n JOIN tasks t ON n.task_id=t.id JOIN users u ON n.triggered_by_id=u.id WHERE n.user_id=? ORDER BY n.created_at DESC LIMIT 30`,[req.user.id]);
+  const[rows]=await pool.query(`
+    SELECT n.*,
+      t.title as task_title,
+      u.username as triggered_by,
+      u.full_name as triggered_by_name,
+      u.avatar_color as triggered_by_color
+    FROM notifications n
+    LEFT JOIN tasks t ON n.task_id=t.id
+    LEFT JOIN users u ON n.triggered_by_id=u.id
+    WHERE n.user_id=? ORDER BY n.created_at DESC LIMIT 50`,[req.user.id]);
   res.json(rows);
 }));
 app.put('/api/notifications/:id/read', auth, wrap(async(req,res)=>{await pool.query('UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?',[req.params.id,req.user.id]);res.json({success:true});}));
@@ -653,6 +671,13 @@ app.post('/api/attendance/clock-in', auth, wrap(async(req,res)=>{
     : (eval_.flag==='late'?'Clocked in late — awaiting manager approval':'Clocked in — awaiting approval');
 
   res.json({success:true,message:msg,clock_in:now,status:eval_.clock_in_status,flag:eval_.flag,category,rules:getRulesForCategory(category)});
+  // If late arrival flagged → alert admins & supervisors
+  if(eval_.flag==='late'){
+    const[uInfo]=await pool.query('SELECT full_name FROM users WHERE id=?',[userId]);
+    const uName=uInfo[0]?.full_name||'An employee';
+    await notifyAdmins({triggeredById:userId,type:'late_arrival',title:'Late Arrival',message:`${uName} clocked in late at ${timeHHMM(now)} on ${today}.`}).catch(()=>{});
+    await notifySupervisors({triggeredById:userId,type:'late_arrival',title:'Late Arrival',message:`${uName} clocked in late at ${timeHHMM(now)} on ${today}.`}).catch(()=>{});
+  }
 }));
 
 app.post('/api/attendance/clock-out', auth, wrap(async(req,res)=>{
@@ -677,6 +702,12 @@ app.post('/api/attendance/clock-out', auth, wrap(async(req,res)=>{
     : (eval_.flag==='early'?'Early clock-out flagged — awaiting manager approval':'Clocked out — awaiting approval');
 
   res.json({success:true,message:msg,clock_out:now,status:eval_.clock_out_status,flag:eval_.flag});
+  if(eval_.flag==='early'){
+    const[uInfo]=await pool.query('SELECT full_name FROM users WHERE id=?',[userId]);
+    const uName=uInfo[0]?.full_name||'An employee';
+    await notifyAdmins({triggeredById:userId,type:'early_departure',title:'Early Departure',message:`${uName} clocked out early at ${timeHHMM(now)} on ${today}.`}).catch(()=>{});
+    await notifySupervisors({triggeredById:userId,type:'early_departure',title:'Early Departure',message:`${uName} clocked out early at ${timeHHMM(now)} on ${today}.`}).catch(()=>{});
+  }
 }));
 
 function getRulesForCategory(cat){
@@ -798,6 +829,24 @@ app.put('/api/admin/attendance/:id', auth, adminOrSupervisor, wrap(async(req,res
   if(admin_note!==undefined){u.push('admin_note=?');v.push(admin_note);}
   if(!u.length) return res.status(400).json({error:'Nothing to update'});
   v.push(id);await pool.query(`UPDATE attendance SET ${u.join(',')} WHERE id=?`,v);
+  // Notify the employee about their attendance status change
+  try{
+    const statusMsg=clock_in_status||clock_out_status;
+    if(statusMsg==='approved'||statusMsg==='rejected'){
+      const[recRow]=await pool.query('SELECT user_id,work_date FROM attendance WHERE id=?',[id]);
+      if(recRow.length){
+        const[revName]=await pool.query('SELECT full_name FROM users WHERE id=?',[req.user.id]);
+        const rn=revName[0]?.full_name||'Manager';
+        const isApproved=statusMsg==='approved';
+        await notify({
+          userId:recRow[0].user_id, triggeredById:req.user.id,
+          type:`attendance_${statusMsg}`,
+          title:`Attendance ${isApproved?'Approved ✓':'Rejected ✗'}`,
+          message:`Your attendance for ${recRow[0].work_date} has been ${statusMsg} by ${rn}.${admin_note?' Note: '+admin_note:''}`
+        }).catch(()=>{});
+      }
+    }
+  }catch{}
   res.json({success:true});
 }));
 
@@ -1006,6 +1055,23 @@ async function tryFinalise(leaveId){
     await pool.query(
       "UPDATE leave_applications SET status='approved',reviewed_by=?,reviewed_at=NOW() WHERE id=?",
       [last.supervisor_id, leaveId]);
+    // Notify applicant — all supervisors approved
+    const[[leaveRow]]=await pool.query('SELECT * FROM leave_applications WHERE id=?',[leaveId]);
+    if(leaveRow){
+      const lbl3=LEAVE_CONFIG[leaveRow.leave_type]?.label||leaveRow.leave_type;
+      await notify({
+        userId:leaveRow.user_id,
+        type:'leave_approved',
+        title:`${lbl3} Approved ✓`,
+        message:`All supervisors have approved your ${lbl3} from ${leaveRow.start_date} to ${leaveRow.end_date}. Your leave is confirmed.`
+      }).catch(()=>{});
+      await notifyAdmins({
+        triggeredById:leaveRow.user_id,
+        type:'leave_fully_approved',
+        title:`Annual Leave Fully Approved`,
+        message:`All supervisors approved the annual leave for user ID ${leaveRow.user_id} (${leaveRow.start_date} – ${leaveRow.end_date}).`
+      }).catch(()=>{});
+    }
   }
 }
 
@@ -1052,6 +1118,21 @@ app.post('/api/leave', auth, wrap(async(req,res)=>{
   const msg = cfg.allSupervisors
     ? `Annual leave submitted — requires approval from all ${supCount} supervisor(s)`
     : 'Leave submitted — awaiting approval';
+
+  // Notify all supervisors + admins about the new leave request
+  const[applicant]=await pool.query('SELECT full_name FROM users WHERE id=?',[req.user.id]);
+  const applicantName=applicant[0]?.full_name||'An employee';
+  const leaveLabel=cfg.label;
+  await notifySupervisors({
+    triggeredById:req.user.id, type:'leave_submitted',
+    title:`New ${leaveLabel} Request`,
+    message:`${applicantName} submitted a ${leaveLabel} request from ${start_date} to ${end_date}.`
+  });
+  await notifyAdmins({
+    triggeredById:req.user.id, type:'leave_submitted',
+    title:`New ${leaveLabel} Request`,
+    message:`${applicantName} submitted a ${leaveLabel} request from ${start_date} to ${end_date}.`
+  });
 
   res.json({success:true, id:leaveId, message:msg});
 }));
@@ -1161,6 +1242,25 @@ app.put('/api/admin/leave/:id', auth, adminOrSupervisor, wrap(async(req,res)=>{
     // Re-check and finalise
     await tryFinalise(id);
 
+    // Notify applicant of this supervisor's individual decision
+    const[supUser]=await pool.query('SELECT full_name FROM users WHERE id=?',[req.user.id]);
+    const supName=supUser[0]?.full_name||'A supervisor';
+    const lbl2=LEAVE_CONFIG[leave.leave_type]?.label||leave.leave_type;
+    if(status==='rejected'){
+      await notify({
+        userId:leave.user_id, triggeredById:req.user.id,
+        type:'leave_rejected',
+        title:'Leave Application Rejected',
+        message:`Your ${lbl2} request was rejected by ${supName}.${reviewer_note?' Note: '+reviewer_note:''}`
+      }).catch(()=>{});
+    } else {
+      await notify({
+        userId:leave.user_id, triggeredById:req.user.id,
+        type:'leave_pending_approvals',
+        title:'Leave Approval Progress',
+        message:`${supName} approved your ${lbl2} request. Waiting for remaining supervisors.`
+      }).catch(()=>{});
+    }
     res.json({success:true, message: status==='approved'
       ? 'Your approval recorded. Leave will be approved once all supervisors approve.'
       : 'Leave application rejected.'});
@@ -1182,6 +1282,16 @@ app.put('/api/admin/leave/:id', auth, adminOrSupervisor, wrap(async(req,res)=>{
           [leave.user_id,localDate(d)]).catch(()=>{});
       }
     }
+    // Notify applicant
+    const[rev]=await pool.query('SELECT full_name FROM users WHERE id=?',[req.user.id]);
+    const revName=rev[0]?.full_name||'Manager';
+    const lbl=LEAVE_CONFIG[leave.leave_type]?.label||leave.leave_type;
+    await notify({
+      userId:leave.user_id, triggeredById:req.user.id,
+      type:`leave_${status}`,
+      title:`Leave ${status==='approved'?'Approved ✓':'Rejected ✗'}`,
+      message:`Your ${lbl} request (${leave.start_date}${leave.start_date!==leave.end_date?' to '+leave.end_date:''}) has been ${status} by ${revName}.${reviewer_note?' Note: '+reviewer_note:''}`
+    }).catch(()=>{});
     res.json({success:true});
   }
 }));
@@ -1229,31 +1339,139 @@ app.get('/api/admin/stats', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 /* ══════════════════════════════════════
-   SMTP
+   EMAIL / SMTP  (Gmail-first)
 ══════════════════════════════════════ */
-app.get('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{const[r]=await pool.query('SELECT id,host,port,username,encryption,from_email,from_name FROM smtp_config LIMIT 1');res.json(r[0]||{});}));
-app.put('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
-  const{host,port,username,password,encryption,from_email,from_name}=req.body;
-  const[ex]=await pool.query('SELECT id FROM smtp_config LIMIT 1');
-  if(ex.length){const s=['host=?','port=?','username=?','encryption=?','from_email=?','from_name=?'],v=[host,port,username,encryption,from_email||'',from_name||'Task Manager'];if(password){s.push('password=?');v.push(password);}v.push(ex[0].id);await pool.query(`UPDATE smtp_config SET ${s.join(',')} WHERE id=?`,v);}
-  else await pool.query('INSERT INTO smtp_config(host,port,username,password,encryption,from_email,from_name) VALUES(?,?,?,?,?,?,?)',[host,port,username,password||'',encryption,from_email||'',from_name||'Task Manager']);
-  res.json({success:true});
-}));
-app.post('/api/admin/smtp/test', auth, adminOnly, wrap(async(req,res)=>{
-  const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');if(!rows.length) return res.status(400).json({error:'SMTP not configured'});
-  const cfg=rows[0],t=nodemailer.createTransport({host:cfg.host,port:cfg.port,secure:cfg.encryption==='ssl',auth:{user:cfg.username,pass:cfg.password}});
-  await t.verify();res.json({success:true,message:'SMTP connection verified!'});
+
+/* Build a nodemailer transporter from stored config */
+async function getTransporter(){
+  const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
+  if(!rows.length) return null;
+  const cfg=rows[0];
+  // Gmail quick-setup: if host is gmail, use service shortcut
+  if(cfg.host==='smtp.gmail.com'||cfg.host==='gmail'){
+    return nodemailer.createTransport({
+      service:'gmail',
+      auth:{user:cfg.username, pass:cfg.password}
+    });
+  }
+  return nodemailer.createTransport({
+    host:cfg.host, port:cfg.port,
+    secure:cfg.encryption==='ssl',
+    auth:{user:cfg.username, pass:cfg.password}
+  });
+}
+
+/* In-app notification + optional email */
+async function notify({userId, triggeredById=null, taskId=null, type, title, message, sendMail=true}){
+  // Insert in-app notification
+  await pool.query(
+    'INSERT INTO notifications(user_id,task_id,triggered_by_id,type,title,message) VALUES(?,?,?,?,?,?)',
+    [userId, taskId||null, triggeredById||null, type, title||null, message||null]
+  ).catch(()=>{});
+
+  // Also send email if configured
+  if(sendMail){
+    try{
+      const tr=await getTransporter();
+      if(!tr) return;
+      const[sr]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
+      const[ur]=await pool.query('SELECT email,full_name FROM users WHERE id=?',[userId]);
+      if(!ur.length) return;
+      const cfg=sr[0], u=ur[0];
+      const html=`<div style="font-family:sans-serif;max-width:560px;margin:0 auto;">
+        <div style="background:#5B8AF0;padding:18px 24px;border-radius:8px 8px 0 0;">
+          <h2 style="color:#fff;margin:0;font-size:16px;">CloudCraft Workspace</h2>
+        </div>
+        <div style="background:#f9fafb;padding:24px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;">
+          <p style="margin-bottom:8px;color:#374151;">Hi <b>${u.full_name}</b>,</p>
+          <h3 style="color:#111827;margin-bottom:12px;">${title||type}</h3>
+          <p style="color:#6b7280;line-height:1.6;">${message||''}</p>
+          <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0;"/>
+          <p style="font-size:12px;color:#9ca3af;">CloudCraft Workspace — automated notification</p>
+        </div>
+      </div>`;
+      await tr.sendMail({
+        from:`"${cfg.from_name||'CloudCraft'}" <${cfg.from_email||cfg.username}>`,
+        to: u.email,
+        subject: title||`Notification: ${type}`,
+        html
+      });
+    }catch(e){ console.error('Email send error:',e.message); }
+  }
+}
+
+/* Legacy wrapper — keep old call sites working */
+async function sendEmail(userId, by, title, type){
+  const msgs={
+    assigned:   `@${by} assigned you to task: "${title}"`,
+    reassigned: `@${by} moved task "${title}" to you`,
+    status_changed: `Status updated on task "${title}" by @${by}`,
+  };
+  const labels={assigned:'Task Assigned',reassigned:'Task Reassigned',status_changed:'Task Status Updated'};
+  await notify({userId, type, title:labels[type]||type, message:msgs[type]||title, sendMail:true}).catch(()=>{});
+}
+
+/* Notify all admins */
+async function notifyAdmins(opts){
+  const[admins]=await pool.query("SELECT id FROM users WHERE role='admin' AND is_active=1");
+  for(const a of admins) await notify({...opts, userId:a.id}).catch(()=>{});
+}
+
+/* Notify all supervisors */
+async function notifySupervisors(opts){
+  const[sups]=await pool.query("SELECT id FROM users WHERE role='supervisor' AND is_active=1");
+  for(const s of sups) await notify({...opts, userId:s.id}).catch(()=>{});
+}
+
+app.get('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
+  const[r]=await pool.query('SELECT id,host,port,username,encryption,from_email,from_name FROM smtp_config LIMIT 1');
+  res.json(r[0]||{});
 }));
 
-async function sendEmail(userId,by,title,type){
-  const[sr]=await pool.query('SELECT * FROM smtp_config LIMIT 1');if(!sr.length)return;
-  const[ur]=await pool.query('SELECT email,full_name FROM users WHERE id=?',[userId]);if(!ur.length)return;
-  const cfg=sr[0],u=ur[0];
-  const subs={assigned:`Assigned: ${title}`,reassigned:`Reassigned to you: ${title}`,status_changed:`Status update on: ${title}`};
-  const bods={assigned:`<p>Hi ${u.full_name},</p><p><b>@${by}</b> assigned you to <b>"${title}"</b>.</p>`,reassigned:`<p>Hi ${u.full_name},</p><p><b>@${by}</b> moved <b>"${title}"</b> to you.</p>`,status_changed:`<p>Hi ${u.full_name},</p><p>Status was updated on <b>"${title}"</b> by @${by}.</p>`};
-  const t=nodemailer.createTransport({host:cfg.host,port:cfg.port,secure:cfg.encryption==='ssl',auth:{user:cfg.username,pass:cfg.password}});
-  await t.sendMail({from:`"${cfg.from_name}"<${cfg.from_email||cfg.username}>`,to:u.email,subject:subs[type]||subs.assigned,html:bods[type]||bods.assigned});
-}
+app.put('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
+  const{host,port,username,password,encryption,from_email,from_name,gmail_mode}=req.body;
+  // Gmail quick-setup
+  const h=gmail_mode?'smtp.gmail.com':host;
+  const p=gmail_mode?587:port;
+  const enc=gmail_mode?'tls':encryption;
+  const[ex]=await pool.query('SELECT id FROM smtp_config LIMIT 1');
+  if(ex.length){
+    const cols=['host=?','port=?','username=?','encryption=?','from_email=?','from_name=?'];
+    const vals=[h,p,username,enc,from_email||username||'',from_name||'CloudCraft'];
+    if(password){cols.push('password=?');vals.push(password);}
+    vals.push(ex[0].id);
+    await pool.query(`UPDATE smtp_config SET ${cols.join(',')} WHERE id=?`,vals);
+  } else {
+    await pool.query(
+      'INSERT INTO smtp_config(host,port,username,password,encryption,from_email,from_name) VALUES(?,?,?,?,?,?,?)',
+      [h,p,username,password||'',enc,from_email||username||'',from_name||'CloudCraft']);
+  }
+  res.json({success:true});
+}));
+
+app.post('/api/admin/smtp/test', auth, adminOnly, wrap(async(req,res)=>{
+  const tr=await getTransporter();
+  if(!tr) return res.status(400).json({error:'Email not configured. Please save settings first.'});
+  await tr.verify();
+  res.json({success:true,message:'Connection verified! Email is working ✓'});
+}));
+
+/* Send a test email to admin */
+app.post('/api/admin/smtp/test-send', auth, adminOnly, wrap(async(req,res)=>{
+  const tr=await getTransporter();
+  if(!tr) return res.status(400).json({error:'Email not configured'});
+  const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
+  const[ur]=await pool.query('SELECT email,full_name FROM users WHERE id=?',[req.user.id]);
+  if(!ur.length) return res.status(404).json({error:'User not found'});
+  const cfg=rows[0],u=ur[0];
+  await tr.sendMail({
+    from:`"${cfg.from_name||'CloudCraft'}" <${cfg.from_email||cfg.username}>`,
+    to: u.email,
+    subject: 'CloudCraft — Email Test',
+    html: `<p>Hi ${u.full_name},</p><p>Your email notification system is working correctly! ✓</p><p>— CloudCraft Workspace</p>`
+  });
+  res.json({success:true,message:`Test email sent to ${u.email}`});
+}));
 
 app.use((err,req,res,next)=>res.status(500).json({error:'Internal server error'}));
 const PORT=process.env.PORT||3001;
