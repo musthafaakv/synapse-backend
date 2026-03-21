@@ -110,6 +110,7 @@ async function setupDatabase(){
       department VARCHAR(100) DEFAULT '',
       avatar_color VARCHAR(7) DEFAULT '#3B82F6',
       is_active BOOLEAN DEFAULT TRUE,
+      must_change_password BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
 
@@ -236,6 +237,7 @@ async function setupDatabase(){
     /* Migrations */
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN employee_category ENUM('office','field') DEFAULT 'office'`).catch(()=>{});
+    await c.query(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT ''`).catch(()=>{});
     await c.query(`ALTER TABLE notifications MODIFY COLUMN type VARCHAR(50) DEFAULT 'assigned'`).catch(()=>{});
     await c.query(`ALTER TABLE task_history CHANGE COLUMN changed_by_id user_id INT NOT NULL`).catch(()=>{});
@@ -313,7 +315,7 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
   let permissions={};
   if(u.role==='supervisor'){const[perms]=await pool.query('SELECT * FROM supervisor_permissions WHERE user_id=?',[u.id]);permissions=perms[0]||{};}
   pool.query('INSERT INTO activity_log(user_id,action,entity_type) VALUES(?,?,?)',[u.id,'login','user']).catch(()=>{});
-  res.json({token,user:{id:u.id,username:u.username,email:u.email,full_name:u.full_name,role:u.role,employee_category:u.employee_category||'office',department:u.department||'',avatar_color:u.avatar_color,permissions}});
+  res.json({token,user:{id:u.id,username:u.username,email:u.email,full_name:u.full_name,role:u.role,employee_category:u.employee_category||'office',department:u.department||'',avatar_color:u.avatar_color,permissions,must_change_password:u.must_change_password?true:false}});
 }));
 
 /* ══════════════════════════════════════
@@ -322,7 +324,7 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
 app.get('/api/users', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(`
     SELECT u.id,u.username,u.email,u.full_name,u.role,u.employee_category,u.department,
-      u.avatar_color,u.is_active,u.created_at,
+      u.avatar_color,u.is_active,u.must_change_password,u.created_at,
       sp.can_approve_attendance,sp.can_view_all_attendance,sp.can_edit_tasks,
       sp.can_create_tasks,sp.can_view_all_tasks,sp.can_manage_holidays
     FROM users u LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id ORDER BY u.full_name`);
@@ -349,7 +351,13 @@ app.put('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
   if(full_name!==undefined){u.push('full_name=?');v.push(full_name);}
   if(role!==undefined){u.push('role=?');v.push(role);}
   if(is_active!==undefined){u.push('is_active=?');v.push(is_active?1:0);}
-  if(password){u.push('password_hash=?');v.push(await bcrypt.hash(password,10));}
+  if(password){
+    u.push('password_hash=?');v.push(await bcrypt.hash(password,10));
+    // If admin sets a new password, default force-change to true unless explicitly false
+    const forceChange=req.body.must_change_password;
+    u.push('must_change_password=?');v.push(forceChange===false?0:1);
+  }
+  if(req.body.must_change_password===false){u.push('must_change_password=?');v.push(0);}
   if(employee_category!==undefined){u.push('employee_category=?');v.push(employee_category);}
   if(department!==undefined){u.push('department=?');v.push(department);}
   if(u.length){v.push(uid);await pool.query(`UPDATE users SET ${u.join(',')} WHERE id=?`,v);}
@@ -863,6 +871,35 @@ app.delete('/api/admin/holidays/:date', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 /* ══════════════════════════════════════
+   PASSWORD CHANGE (forced or voluntary)
+══════════════════════════════════════ */
+app.post('/api/auth/change-password', auth, wrap(async(req,res)=>{
+  const{current_password,new_password}=req.body;
+  if(!new_password||new_password.length<8) return res.status(400).json({error:'New password must be at least 8 characters'});
+  const[rows]=await pool.query('SELECT * FROM users WHERE id=?',[req.user.id]);
+  if(!rows.length) return res.status(404).json({error:'User not found'});
+  const u=rows[0];
+  // If not a forced change, verify current password
+  if(!u.must_change_password){
+    if(!current_password) return res.status(400).json({error:'Current password required'});
+    if(!await bcrypt.compare(current_password,u.password_hash)) return res.status(400).json({error:'Current password is incorrect'});
+  }
+  const hash=await bcrypt.hash(new_password,10);
+  await pool.query('UPDATE users SET password_hash=?,must_change_password=0 WHERE id=?',[hash,req.user.id]);
+  res.json({success:true,message:'Password changed successfully'});
+}));
+
+/* Admin: force-reset any user's password */
+app.post('/api/admin/users/:id/reset-password', auth, adminOnly, wrap(async(req,res)=>{
+  const{new_password,force_change}=req.body;
+  if(!new_password||new_password.length<6) return res.status(400).json({error:'Password must be at least 6 characters'});
+  const hash=await bcrypt.hash(new_password,10);
+  const mustChange=force_change===false?0:1;
+  await pool.query('UPDATE users SET password_hash=?,must_change_password=? WHERE id=?',[hash,mustChange,req.params.id]);
+  res.json({success:true,message:mustChange?'Password reset. User will be prompted to change it on next login.':'Password reset successfully.'});
+}));
+
+/* ══════════════════════════════════════
    LEAVE APPLICATIONS
 ══════════════════════════════════════ */
 
@@ -877,7 +914,8 @@ const LEAVE_CONFIG = {
 
 // Submit leave application (members + supervisors)
 app.post('/api/leave', auth, wrap(async(req,res)=>{
-  if(req.user.role==='admin') return res.status(403).json({error:'Administrators do not apply for leave. Use admin override.'});
+  // Admins manage leave via override; members & supervisors can apply
+  if(req.user.role==='admin') return res.status(403).json({error:'Administrators use the admin override feature for leave management.'});
   const{leave_type,start_date,end_date,reason,half_day_period,half_day_start,half_day_end}=req.body;
 
   if(!leave_type||!start_date||!end_date) return res.status(400).json({error:'Leave type and dates are required'});
