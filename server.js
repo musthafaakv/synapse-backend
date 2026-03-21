@@ -974,16 +974,19 @@ app.put('/api/auth/change-email', auth, adminOnly, wrap(async(req,res)=>{
 ══════════════════════════════════════ */
 app.post('/api/auth/change-password', auth, wrap(async(req,res)=>{
   const{current_password,new_password}=req.body;
-  if(!new_password||new_password.length<8) return res.status(400).json({error:'New password must be at least 8 characters'});
+  if(!new_password||new_password.trim().length<8)
+    return res.status(400).json({error:'New password must be at least 8 characters'});
   const[rows]=await pool.query('SELECT * FROM users WHERE id=?',[req.user.id]);
   if(!rows.length) return res.status(404).json({error:'User not found'});
   const u=rows[0];
-  // If not a forced change, verify current password
+  // Verify current password (skip check only for forced reset flow)
   if(!u.must_change_password){
-    if(!current_password) return res.status(400).json({error:'Current password required'});
-    if(!await bcrypt.compare(current_password,u.password_hash)) return res.status(400).json({error:'Current password is incorrect'});
+    if(!current_password||!current_password.trim())
+      return res.status(400).json({error:'Current password is required'});
+    const match=await bcrypt.compare(current_password.trim(),u.password_hash);
+    if(!match) return res.status(400).json({error:'Current password is incorrect'});
   }
-  const hash=await bcrypt.hash(new_password,10);
+  const hash=await bcrypt.hash(new_password.trim(),10);
   await pool.query('UPDATE users SET password_hash=?,must_change_password=0 WHERE id=?',[hash,req.user.id]);
   res.json({success:true,message:'Password changed successfully'});
 }));
@@ -1347,17 +1350,28 @@ async function getTransporter(){
   const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
   if(!rows.length) return null;
   const cfg=rows[0];
-  // Gmail quick-setup: if host is gmail, use service shortcut
+  if(!cfg.username||!cfg.password) return null;
+
+  // Gmail: always use explicit host/port/tls (more reliable than service:'gmail')
   if(cfg.host==='smtp.gmail.com'||cfg.host==='gmail'){
     return nodemailer.createTransport({
-      service:'gmail',
-      auth:{user:cfg.username, pass:cfg.password}
+      host:'smtp.gmail.com',
+      port:587,
+      secure:false,          // STARTTLS on port 587
+      requireTLS:true,
+      auth:{user:cfg.username, pass:cfg.password},
+      tls:{rejectUnauthorized:false}
     });
   }
+
+  // Generic SMTP
   return nodemailer.createTransport({
-    host:cfg.host, port:cfg.port,
+    host:cfg.host,
+    port:parseInt(cfg.port)||587,
     secure:cfg.encryption==='ssl',
-    auth:{user:cfg.username, pass:cfg.password}
+    requireTLS:cfg.encryption==='tls',
+    auth:{user:cfg.username, pass:cfg.password},
+    tls:{rejectUnauthorized:false}
   });
 }
 
@@ -1438,13 +1452,19 @@ app.put('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
   if(ex.length){
     const cols=['host=?','port=?','username=?','encryption=?','from_email=?','from_name=?'];
     const vals=[h,p,username,enc,from_email||username||'',from_name||'CloudCraft'];
-    if(password){cols.push('password=?');vals.push(password);}
+    // Only update password if a new one was explicitly provided
+    if(password&&password.trim()){
+      cols.push('password=?');
+      vals.push(password.trim());
+    }
     vals.push(ex[0].id);
     await pool.query(`UPDATE smtp_config SET ${cols.join(',')} WHERE id=?`,vals);
   } else {
+    if(!password||!password.trim())
+      return res.status(400).json({error:'Password/App Password is required for first-time setup'});
     await pool.query(
       'INSERT INTO smtp_config(host,port,username,password,encryption,from_email,from_name) VALUES(?,?,?,?,?,?,?)',
-      [h,p,username,password||'',enc,from_email||username||'',from_name||'CloudCraft']);
+      [h,p,username,password.trim(),enc,from_email||username||'',from_name||'CloudCraft']);
   }
   res.json({success:true});
 }));
