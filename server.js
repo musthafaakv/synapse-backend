@@ -255,6 +255,53 @@ async function setupDatabase(){
       UNIQUE KEY uniq_leave_sup(leave_id,supervisor_id),
       FOREIGN KEY(leave_id) REFERENCES leave_applications(id) ON DELETE CASCADE,
       FOREIGN KEY(supervisor_id) REFERENCES users(id) ON DELETE CASCADE)`);
+    await c.query(`CREATE TABLE IF NOT EXISTS clients(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) DEFAULT NULL,
+      phone VARCHAR(50) DEFAULT NULL,
+      address TEXT DEFAULT NULL,
+      trn VARCHAR(50) DEFAULT NULL,
+      is_active TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS quotations(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      quotation_number VARCHAR(50) NOT NULL,
+      quotation_date DATE NOT NULL,
+      valid_till DATE DEFAULT NULL,
+      subject VARCHAR(255) DEFAULT NULL,
+      client_id INT DEFAULT NULL,
+      client_name VARCHAR(255) DEFAULT NULL,
+      client_email VARCHAR(255) DEFAULT NULL,
+      client_phone VARCHAR(50) DEFAULT NULL,
+      client_address TEXT DEFAULT NULL,
+      client_trn VARCHAR(50) DEFAULT NULL,
+      currency VARCHAR(10) DEFAULT 'AED',
+      vat_rate DECIMAL(5,2) DEFAULT 5.00,
+      subtotal DECIMAL(12,2) DEFAULT 0.00,
+      vat_amount DECIMAL(12,2) DEFAULT 0.00,
+      discount_amount DECIMAL(12,2) DEFAULT 0.00,
+      total DECIMAL(12,2) DEFAULT 0.00,
+      notes TEXT DEFAULT NULL,
+      status ENUM('draft','sent','accepted','rejected') DEFAULT 'draft',
+      created_by INT DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE SET NULL,
+      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS quotation_items(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      quotation_id INT NOT NULL,
+      sort_order INT DEFAULT 0,
+      item_name VARCHAR(255) DEFAULT '',
+      description TEXT DEFAULT NULL,
+      quantity DECIMAL(10,2) DEFAULT 1.00,
+      unit_price DECIMAL(12,2) DEFAULT 0.00,
+      amount DECIMAL(12,2) DEFAULT 0.00,
+      FOREIGN KEY(quotation_id) REFERENCES quotations(id) ON DELETE CASCADE)`);
+
 
     /* Migrations */
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
@@ -1327,6 +1374,102 @@ app.delete('/api/leave/:id', auth, wrap(async(req,res)=>{
 
 
 /* ══════════════════════════════════════
+   CLIENTS
+══════════════════════════════════════ */
+app.get('/api/clients', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM clients WHERE is_active=1 ORDER BY name');
+  res.json(rows);
+}));
+app.post('/api/clients', auth, wrap(async(req,res)=>{
+  const{name,email,phone,address,trn}=req.body;
+  if(!name) return res.status(400).json({error:'Client name required'});
+  const[r]=await pool.query('INSERT INTO clients(name,email,phone,address,trn) VALUES(?,?,?,?,?)',
+    [name,email||null,phone||null,address||null,trn||null]);
+  res.json({success:true,id:r.insertId});
+}));
+app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
+  const{name,email,phone,address,trn}=req.body;
+  await pool.query('UPDATE clients SET name=?,email=?,phone=?,address=?,trn=? WHERE id=?',
+    [name,email||null,phone||null,address||null,trn||null,req.params.id]);
+  res.json({success:true});
+}));
+app.delete('/api/clients/:id', auth, adminOnly, wrap(async(req,res)=>{
+  await pool.query('UPDATE clients SET is_active=0 WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+/* ══════════════════════════════════════
+   QUOTATIONS
+══════════════════════════════════════ */
+async function nextQuotationNumber(){
+  const year=new Date().getFullYear();
+  const[rows]=await pool.query(
+    "SELECT quotation_number FROM quotations WHERE quotation_number LIKE ? ORDER BY id DESC LIMIT 1",
+    ['QT/CCT/'+year+'-%']);
+  let seq=600;
+  if(rows.length){const last=parseInt(rows[0].quotation_number.split('-').pop()||'600');seq=last+1;}
+  return 'QT/CCT/'+year+'-'+seq;
+}
+
+app.get('/api/quotations', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT q.*,u.full_name as creator_name FROM quotations q LEFT JOIN users u ON q.created_by=u.id ORDER BY q.created_at DESC');
+  res.json(rows);
+}));
+
+app.get('/api/quotations/:id', auth, wrap(async(req,res)=>{
+  const[[q]]=await pool.query(
+    'SELECT q.*,u.full_name as creator_name FROM quotations q LEFT JOIN users u ON q.created_by=u.id WHERE q.id=?',[req.params.id]);
+  if(!q) return res.status(404).json({error:'Not found'});
+  const[items]=await pool.query('SELECT * FROM quotation_items WHERE quotation_id=? ORDER BY sort_order,id',[q.id]);
+  q.items=items;
+  res.json(q);
+}));
+
+app.post('/api/quotations', auth, wrap(async(req,res)=>{
+  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items}=req.body;
+  const qnum=await nextQuotationNumber();
+  const[r]=await pool.query(
+    'INSERT INTO quotations(quotation_number,quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [qnum,quotation_date,valid_till||null,subject||null,client_id||null,client_name||null,client_email||null,client_phone||null,client_address||null,client_trn||null,currency||'AED',vat_rate??5,subtotal||0,vat_amount||0,discount_amount||0,total||0,notes||null,status||'draft',req.user.id]);
+  const qid=r.insertId;
+  if(items&&items.length){
+    for(let i=0;i<items.length;i++){
+      const it=items[i];
+      await pool.query('INSERT INTO quotation_items(quotation_id,sort_order,item_name,description,quantity,unit_price,amount) VALUES(?,?,?,?,?,?,?)',
+        [qid,i,it.item_name||'',it.description||null,it.quantity||1,it.unit_price||0,it.amount||0]);
+    }
+  }
+  res.json({success:true,id:qid,quotation_number:qnum});
+}));
+
+app.put('/api/quotations/:id', auth, wrap(async(req,res)=>{
+  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items}=req.body;
+  await pool.query(
+    'UPDATE quotations SET quotation_date=?,valid_till=?,subject=?,client_id=?,client_name=?,client_email=?,client_phone=?,client_address=?,client_trn=?,currency=?,vat_rate=?,subtotal=?,vat_amount=?,discount_amount=?,total=?,notes=?,status=?,updated_at=NOW() WHERE id=?',
+    [quotation_date,valid_till||null,subject||null,client_id||null,client_name||null,client_email||null,client_phone||null,client_address||null,client_trn||null,currency||'AED',vat_rate??5,subtotal||0,vat_amount||0,discount_amount||0,total||0,notes||null,status||'draft',req.params.id]);
+  await pool.query('DELETE FROM quotation_items WHERE quotation_id=?',[req.params.id]);
+  if(items&&items.length){
+    for(let i=0;i<items.length;i++){
+      const it=items[i];
+      await pool.query('INSERT INTO quotation_items(quotation_id,sort_order,item_name,description,quantity,unit_price,amount) VALUES(?,?,?,?,?,?,?)',
+        [req.params.id,i,it.item_name||'',it.description||null,it.quantity||1,it.unit_price||0,it.amount||0]);
+    }
+  }
+  res.json({success:true});
+}));
+
+app.delete('/api/quotations/:id', auth, wrap(async(req,res)=>{
+  if(req.user.role!=='admin'){
+    const[[q]]=await pool.query('SELECT created_by FROM quotations WHERE id=?',[req.params.id]);
+    if(!q||q.created_by!==req.user.id) return res.status(403).json({error:'Not authorized'});
+  }
+  await pool.query('DELETE FROM quotations WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+
+/* ══════════════════════════════════════
    ADMIN TASK STATS
 ══════════════════════════════════════ */
 app.get('/api/admin/stats', auth, adminOnly, wrap(async(req,res)=>{
@@ -1345,125 +1488,147 @@ app.get('/api/admin/stats', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 /* ══════════════════════════════════════
-   EMAIL / SMTP  (Gmail-first)
+   EMAIL — HTTP API  (Railway-compatible)
+   SMTP is BLOCKED on Railway. Use HTTP
+   API providers: Resend / Brevo / SendGrid
 ══════════════════════════════════════ */
 
-/* Build a nodemailer transporter from stored config */
-/* Build transporter from config — resolves IP→hostname automatically */
-function buildTransport(cfg, overridePort, overrideSecure){
-  const port  = overridePort   !== undefined ? overridePort   : parseInt(cfg.port)||587;
-  const secure= overrideSecure !== undefined ? overrideSecure : cfg.encryption==='ssl';
-  return nodemailer.createTransport({
-    host:  cfg.host,
-    port,
-    secure,
-    requireTLS: !secure && port===587,
-    connectionTimeout: 15000,
-    greetingTimeout:   10000,
-    socketTimeout:     15000,
-    auth:{ user:cfg.username, pass:cfg.password },
-    tls:{ rejectUnauthorized:false }
-  });
-}
-
-function isGmailHost(h){
-  return h==='smtp.gmail.com'||h==='gmail'||
-         (h||'').includes('gmail.com');
-}
-
-async function getTransporter(){
+async function sendEmailAPI({to, toName, subject, html}){
   const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
-  if(!rows.length) return null;
+  if(!rows.length) return; // Not configured — skip silently
   const cfg=rows[0];
-  if(!cfg.username||!cfg.password) return null;
+  if(!cfg.password||!cfg.username) return;
 
-  // Resolve IP to hostname (Railway blocks raw-IP SMTP)
-  const isIP=/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(cfg.host);
-  if(isIP){
-    const domain=(cfg.username.split('@')[1]||'');
-    if(domain) cfg.host='mail.'+domain;
+  const provider=(cfg.host||'resend').toLowerCase().trim();
+  const fromAddr=cfg.from_email||cfg.username||'noreply@example.com';
+  const fromName=cfg.from_name||'CloudCraft Workspace';
+
+  try{
+    /* ── Resend.com ── free 100/day, easiest setup */
+    if(provider==='resend'||provider==='resend.com'){
+      const r=await fetch('https://api.resend.com/emails',{
+        method:'POST',
+        headers:{'Authorization':'Bearer '+cfg.password,'Content-Type':'application/json'},
+        body:JSON.stringify({from:fromName+' <'+fromAddr+'>',to:[to],subject,html})
+      });
+      const d=await r.json();
+      if(!r.ok) throw new Error(d.message||d.name||'Resend error: '+r.status);
+      return d;
+    }
+
+    /* ── Brevo.com (ex-Sendinblue) ── free 300/day */
+    if(provider==='brevo'||provider==='sendinblue'||provider==='brevo.com'){
+      const r=await fetch('https://api.brevo.com/v3/smtp/email',{
+        method:'POST',
+        headers:{'api-key':cfg.password,'Content-Type':'application/json'},
+        body:JSON.stringify({
+          sender:{name:fromName,email:fromAddr},
+          to:[{email:to,name:toName||to}],
+          subject,htmlContent:html
+        })
+      });
+      const d=await r.json();
+      if(!r.ok) throw new Error(d.message||'Brevo error: '+r.status);
+      return d;
+    }
+
+    /* ── SendGrid ── free 100/day */
+    if(provider==='sendgrid'||provider==='sendgrid.com'){
+      const r=await fetch('https://api.sendgrid.com/v3/mail/send',{
+        method:'POST',
+        headers:{'Authorization':'Bearer '+cfg.password,'Content-Type':'application/json'},
+        body:JSON.stringify({
+          personalizations:[{to:[{email:to,name:toName||to}]}],
+          from:{email:fromAddr,name:fromName},
+          subject,
+          content:[{type:'text/html',value:html}]
+        })
+      });
+      if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(JSON.stringify(d.errors||'SendGrid error'));}
+      return {ok:true};
+    }
+
+    /* ── Microsoft Office 365 via Graph API ── */
+    if(provider==='microsoft'||provider==='office365'||provider==='outlook'){
+      const parts=(cfg.username||'').split('|');
+      const clientId=parts[0]||'';
+      const tenantId=parts[1]||'common';
+      const clientSecret=cfg.password||'';
+      if(!clientId||!clientSecret) throw new Error('Microsoft: Client ID and Secret required. See setup instructions.');
+      const tokenRes=await fetch('https://login.microsoftonline.com/'+tenantId+'/oauth2/v2.0/token',{
+        method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:new URLSearchParams({grant_type:'client_credentials',client_id:clientId,client_secret:clientSecret,scope:'https://graph.microsoft.com/.default'})
+      });
+      const tokenData=await tokenRes.json();
+      if(!tokenRes.ok||!tokenData.access_token)
+        throw new Error('Microsoft auth failed: '+(tokenData.error_description||tokenData.error||'check Client ID/Secret/Tenant'));
+      const sender=cfg.from_email||fromAddr;
+      const mailRes=await fetch('https://graph.microsoft.com/v1.0/users/'+sender+'/sendMail',{
+        method:'POST',
+        headers:{'Authorization':'Bearer '+tokenData.access_token,'Content-Type':'application/json'},
+        body:JSON.stringify({message:{subject,body:{contentType:'HTML',content:html},toRecipients:[{emailAddress:{address:to,name:toName||to}}],from:{emailAddress:{address:sender,name:fromName}}},saveToSentItems:false})
+      });
+      if(!mailRes.ok){const d=await mailRes.json().catch(()=>({}));throw new Error('Graph API error: '+(d.error?.message||'status '+mailRes.status));}
+      return {ok:true};
+    }
+
+    console.warn('Email provider not configured. Set host to: resend, brevo, sendgrid, or microsoft.');
+  }catch(e){
+    console.error('Email API error:',e.message);
   }
-
-  // Gmail: use service shortcut (nodemailer handles port/SSL automatically)
-  if(isGmailHost(cfg.host)||cfg.username.endsWith('@gmail.com')||cfg.username.endsWith('@googlemail.com')){
-    return nodemailer.createTransport({
-      service:'gmail',
-      auth:{user:cfg.username, pass:cfg.password},
-      connectionTimeout:20000,
-      greetingTimeout:15000,
-      socketTimeout:20000,
-    });
-  }
-
-  return buildTransport(cfg);
 }
 
-/* In-app notification + optional email */
+/* In-app + email notification */
 async function notify({userId, triggeredById=null, taskId=null, type, title, message, sendMail=true}){
-  // Insert in-app notification
   await pool.query(
     'INSERT INTO notifications(user_id,task_id,triggered_by_id,type,title,message) VALUES(?,?,?,?,?,?)',
-    [userId, taskId||null, triggeredById||null, type, title||null, message||null]
+    [userId,taskId||null,triggeredById||null,type,title||null,message||null]
   ).catch(()=>{});
 
-  // Also send email if configured
   if(sendMail){
     try{
-      const tr=await getTransporter();
-      if(!tr) return;
-      const[sr]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
       const[ur]=await pool.query('SELECT email,full_name FROM users WHERE id=?',[userId]);
-      if(!ur.length) return;
-      const cfg=sr[0], u=ur[0];
-      const html=`<div style="font-family:sans-serif;max-width:560px;margin:0 auto;">
-        <div style="background:#5B8AF0;padding:18px 24px;border-radius:8px 8px 0 0;">
-          <h2 style="color:#fff;margin:0;font-size:16px;">CloudCraft Workspace</h2>
-        </div>
-        <div style="background:#f9fafb;padding:24px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;">
-          <p style="margin-bottom:8px;color:#374151;">Hi <b>${u.full_name}</b>,</p>
-          <h3 style="color:#111827;margin-bottom:12px;">${title||type}</h3>
-          <p style="color:#6b7280;line-height:1.6;">${message||''}</p>
-          <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0;"/>
-          <p style="font-size:12px;color:#9ca3af;">CloudCraft Workspace — automated notification</p>
-        </div>
-      </div>`;
-      await tr.sendMail({
-        from:`"${cfg.from_name||'CloudCraft'}" <${cfg.from_email||cfg.username}>`,
-        to: u.email,
-        subject: title||`Notification: ${type}`,
-        html
-      });
-    }catch(e){ console.error('Email send error:',e.message); }
+      if(!ur.length||!ur[0].email) return;
+      const u=ur[0];
+      const html='<div style="font-family:sans-serif;max-width:560px;margin:0 auto;">'+
+        '<div style="background:#5B8AF0;padding:18px 24px;border-radius:8px 8px 0 0;">'+
+        '<h2 style="color:#fff;margin:0;font-size:16px;">CloudCraft Workspace</h2></div>'+
+        '<div style="background:#f9fafb;padding:24px;border-radius:0 0 8px 8px;border:1px solid #e5e7eb;">'+
+        '<p style="margin-bottom:8px;color:#374151;">Hi <b>'+u.full_name+'</b>,</p>'+
+        '<h3 style="color:#111827;margin-bottom:12px;">'+(title||type)+'</h3>'+
+        '<p style="color:#6b7280;line-height:1.6;">'+(message||'')+'</p>'+
+        '<hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0;"/>'+
+        '<p style="font-size:12px;color:#9ca3af;">CloudCraft Workspace — automated notification</p>'+
+        '</div></div>';
+      await sendEmailAPI({to:u.email,toName:u.full_name,subject:title||type,html});
+    }catch(e){ console.error('notify email error:',e.message); }
   }
 }
 
 /* Legacy wrapper — keep old call sites working */
-async function sendEmail(userId, by, title, type){
+async function sendEmail(userId, by, taskTitle, type){
   const msgs={
-    assigned:   `@${by} assigned you to task: "${title}"`,
-    reassigned: `@${by} moved task "${title}" to you`,
-    status_changed: `Status updated on task "${title}" by @${by}`,
+    assigned:   '@'+by+' assigned you to task: "'+taskTitle+'"',
+    reassigned: '@'+by+' moved task "'+taskTitle+'" to you',
+    status_changed:'Status updated on task "'+taskTitle+'" by @'+by,
   };
   const labels={assigned:'Task Assigned',reassigned:'Task Reassigned',status_changed:'Task Status Updated'};
-  await notify({userId, type, title:labels[type]||type, message:msgs[type]||title, sendMail:true}).catch(()=>{});
+  await notify({userId,type,title:labels[type]||type,message:msgs[type]||taskTitle,sendMail:true}).catch(()=>{});
 }
 
-/* Notify all admins */
 async function notifyAdmins(opts){
   const[admins]=await pool.query("SELECT id FROM users WHERE role='admin' AND is_active=1");
-  for(const a of admins) await notify({...opts, userId:a.id}).catch(()=>{});
+  for(const a of admins) await notify({...opts,userId:a.id}).catch(()=>{});
 }
-
-/* Notify all supervisors */
 async function notifySupervisors(opts){
   const[sups]=await pool.query("SELECT id FROM users WHERE role='supervisor' AND is_active=1");
-  for(const s of sups) await notify({...opts, userId:s.id}).catch(()=>{});
+  for(const sv of sups) await notify({...opts,userId:sv.id}).catch(()=>{});
 }
 
 app.get('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
   const[r]=await pool.query('SELECT id,host,port,username,encryption,from_email,from_name FROM smtp_config LIMIT 1');
   const cfg=r[0]||{};
-  // Also return whether a password is saved (without revealing it)
   if(r[0]){
     const[pw]=await pool.query('SELECT LENGTH(password)>0 as has_password FROM smtp_config WHERE id=?',[r[0].id]);
     cfg.has_password=pw[0]?.has_password===1;
@@ -1472,159 +1637,86 @@ app.get('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 app.put('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
-  const{host,port,username,password,encryption,from_email,from_name,gmail_mode}=req.body;
-  // Gmail quick-setup
-  const h=gmail_mode?'smtp.gmail.com':host;
-  const p=gmail_mode?587:port;
-  const enc=gmail_mode?'tls':encryption;
+  const{provider,api_key,from_email,from_name,username}=req.body;
+  // 'provider' maps to the 'host' column (resend/brevo/sendgrid)
+  // 'api_key' maps to the 'password' column
+  const host=provider||req.body.host||'resend';
+  const fromEmail=from_email||username||'';
+  const finalUsername=req.body.ms_client_id
+    ? (req.body.ms_client_id.trim()+'|'+(req.body.ms_tenant_id||'common').trim())
+    : (username||fromEmail||'');
+  const finalApiKey=api_key||req.body.ms_client_secret||'';
+
   const[ex]=await pool.query('SELECT id FROM smtp_config LIMIT 1');
   if(ex.length){
     const cols=['host=?','port=?','username=?','encryption=?','from_email=?','from_name=?'];
-    const vals=[h,p,username,enc,from_email||username||'',from_name||'CloudCraft'];
-    // Only update password if a new one was explicitly provided
-    if(password&&password.trim()){
-      cols.push('password=?');
-      vals.push(password.trim());
-    }
+    const vals=[provider,443,finalUsername,'none',fromEmail||finalUsername,from_name||'CloudCraft Workspace'];
+    if(finalApiKey&&finalApiKey.trim()){cols.push('password=?');vals.push(finalApiKey.trim());}
     vals.push(ex[0].id);
-    await pool.query(`UPDATE smtp_config SET ${cols.join(',')} WHERE id=?`,vals);
-  } else {
-    // First-time insert — password can be blank if they want to configure incrementally
+    await pool.query('UPDATE smtp_config SET '+cols.join(',')+'  WHERE id=?',vals);
+  }else{
     await pool.query(
       'INSERT INTO smtp_config(host,port,username,password,encryption,from_email,from_name) VALUES(?,?,?,?,?,?,?)',
-      [h,p,username||'',password?.trim()||'',enc,from_email||username||'',from_name||'CloudCraft Workspace']);
+      [provider,443,finalUsername,finalApiKey.trim(),'none',fromEmail||finalUsername,from_name||'CloudCraft Workspace']);
   }
   res.json({success:true});
 }));
 
+/* Test — sends a real test email via the HTTP API */
 app.post('/api/admin/smtp/test', auth, adminOnly, wrap(async(req,res)=>{
   const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
-  if(!rows.length) return res.status(400).json({error:'No email settings saved yet. Please save your Gmail address and App Password first.'});
-  const cfg={...rows[0]};
-  if(!cfg.username) return res.status(400).json({error:'Email address not set. Please save settings first.'});
-  if(!cfg.password) return res.status(400).json({error:'Password not saved. Please enter your App Password and click Save Settings first.'});
+  if(!rows.length) return res.status(400).json({error:'Not configured yet. Save your settings first.'});
+  const cfg=rows[0];
+  if(!cfg.password) return res.status(400).json({error:'API key not saved. Enter your API key and click Save first.'});
 
-  const isGmail=isGmailHost(cfg.host)||cfg.username.endsWith('@gmail.com')||cfg.username.endsWith('@googlemail.com');
+  const provider=(cfg.host||'resend').toLowerCase();
+  const isMicrosoft=provider==='microsoft'||provider==='office365'||provider==='outlook';
+  const[ur]=await pool.query('SELECT email,full_name FROM users WHERE id=?',[req.user.id]);
+  if(!ur.length||!ur[0].email) return res.status(400).json({error:'Admin account has no email address. Update your email first.'});
+  const u=ur[0];
+  const fromAddr=cfg.from_email||cfg.username||u.email;
+  const fromName=cfg.from_name||'CloudCraft Workspace';
 
-  if(isGmail){
-    // Gmail: try service shortcut first (most reliable on all Node versions)
-    const gmailCombos=[
-      // Nodemailer service shortcut
-      ()=>nodemailer.createTransport({service:'gmail',auth:{user:cfg.username,pass:cfg.password},connectionTimeout:20000,socketTimeout:20000}),
-      // Explicit 465 SSL
-      ()=>nodemailer.createTransport({host:'smtp.gmail.com',port:465,secure:true,auth:{user:cfg.username,pass:cfg.password},connectionTimeout:20000,socketTimeout:20000,tls:{rejectUnauthorized:false}}),
-      // Explicit 587 TLS
-      ()=>nodemailer.createTransport({host:'smtp.gmail.com',port:587,secure:false,requireTLS:true,auth:{user:cfg.username,pass:cfg.password},connectionTimeout:20000,socketTimeout:20000,tls:{rejectUnauthorized:false}}),
-    ];
-    const labels=['Gmail service shortcut','smtp.gmail.com:465 SSL','smtp.gmail.com:587 TLS'];
-    const attempts=[];
-    for(let i=0;i<gmailCombos.length;i++){
-      try{
-        const tr=gmailCombos[i]();
-        await tr.verify();
-        // Save working config
-        const port=i===0?587:i===1?465:587;
-        const enc=i===1?'ssl':'tls';
-        await pool.query('UPDATE smtp_config SET host=?,port=?,encryption=? WHERE id=?',['smtp.gmail.com',port,enc,cfg.id]);
-        return res.json({success:true,message:`✓ Gmail connected via ${labels[i]}!
+  const testHtml='<div style="font-family:sans-serif;padding:24px;max-width:500px;">'+
+    '<h2 style="color:#5B8AF0;">✓ CloudCraft Email Test</h2>'+
+    '<p>Hi <b>'+u.full_name+'</b>,</p>'+
+    '<p>Your email notifications are configured and working correctly!</p>'+
+    '<p style="color:#6b7280;font-size:13px;">Provider: <b>'+provider+'</b><br/>From: '+fromAddr+'</p>'+
+    '</div>';
 
-Your email is working correctly. Settings saved.`});
-      }catch(e){
-        const isTimeout=e.message.toLowerCase().includes('timeout')||e.message.toLowerCase().includes('connect');
-        const isAuth=e.message.toLowerCase().includes('auth')||e.message.toLowerCase().includes('535')||e.message.toLowerCase().includes('534')||e.message.toLowerCase().includes('username and password');
-        attempts.push({label:labels[i],error:e.message,isTimeout,isAuth});
-      }
-    }
-    // Diagnose the most likely issue
-    const hasAuth=attempts.some(a=>a.isAuth);
-    const allTimeout=attempts.every(a=>a.isTimeout);
-    let diagnosis='';
-    if(hasAuth){
-      diagnosis=`
-
-⚠️ AUTHENTICATION FAILED — Wrong App Password
-`+
-        `Your Gmail address is correct but the password was rejected.
-
-`+
-        `Fix:
-`+
-        `1. Go to myaccount.google.com
-`+
-        `2. Security → 2-Step Verification (must be ON)
-`+
-        `3. Security → App passwords
-`+
-        `4. Create: App=Mail, Device=Other (name: CloudCraft)
-`+
-        `5. Copy the 16-char code (e.g. abcd efgh ijkl mnop)
-`+
-        `6. Paste it in the App Password field and Save Settings again`;
-    } else if(allTimeout){
-      diagnosis=`
-
-⚠️ CONNECTION TIMEOUT
-`+
-        `Cannot reach Gmail SMTP servers. Possible causes:
-`+
-        `• Outbound SMTP is blocked by your hosting provider
-`+
-        `• If Railway is blocking SMTP, consider using Brevo/SendGrid free tier instead`;
-    }
-    const attemptSummary=attempts.map((a,i)=>(i+1)+'. '+a.label+': '+a.error.substring(0,100)).join('\n');
-    return res.status(400).json({error:'Gmail connection failed:\n'+attemptSummary+diagnosis});
+  try{
+    await sendEmailAPI({to:u.email,toName:u.full_name,subject:'CloudCraft Email Test',html:testHtml});
+    res.json({success:true,message:'Test email sent to '+u.email+' via '+provider+'. Check your inbox (and spam folder).'});
+  }catch(e){
+    // Return specific, actionable error
+    let hint='';
+    const msg=e.message||'';
+    if(msg.includes('Invalid API')||msg.includes('401')||msg.includes('403')||msg.includes('Unauthorized'))
+      hint='\n\nFix: Your API key is invalid or expired. Generate a new one from the provider dashboard.';
+    else if(msg.includes('domain')||msg.includes('sender')||msg.includes('verified'))
+      hint='\n\nFix: Your sender email domain is not verified in '+provider+'. Add and verify your domain first.';
+    else if(msg.includes('quota')||msg.includes('limit')||msg.includes('429'))
+      hint='\n\nFix: Daily sending limit reached. Try again tomorrow or upgrade your plan.';
+    res.status(400).json({error:'Send failed via '+provider+': '+msg+hint});
   }
-
-  // Non-Gmail: try saved config + fallbacks
-  const isIP=/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(cfg.host);
-  let resolvedHost=isIP?('mail.'+(cfg.username.split('@')[1]||cfg.host)):cfg.host;
-  const combos=[
-    {host:resolvedHost,port:parseInt(cfg.port)||587,secure:cfg.encryption==='ssl',label:`${resolvedHost}:${cfg.port}`},
-    {host:resolvedHost,port:465,secure:true,label:`${resolvedHost}:465 SSL`},
-    {host:resolvedHost,port:587,secure:false,label:`${resolvedHost}:587 TLS`},
-  ];
-  const seen=new Set(),uniq=combos.filter(c=>{const k=`${c.host}:${c.port}:${c.secure}`;if(seen.has(k))return false;seen.add(k);return true;});
-  const attempts=[];
-  for(const combo of uniq){
-    try{
-      const tr=nodemailer.createTransport({host:combo.host,port:combo.port,secure:combo.secure,requireTLS:!combo.secure&&combo.port===587,connectionTimeout:15000,greetingTimeout:10000,socketTimeout:15000,auth:{user:cfg.username,pass:cfg.password},tls:{rejectUnauthorized:false}});
-      await tr.verify();
-      await pool.query('UPDATE smtp_config SET host=?,port=?,encryption=? WHERE id=?',[combo.host,combo.port,combo.secure?'ssl':(combo.port===587?'tls':'none'),cfg.id]);
-      return res.json({success:true,message:`✓ Connected via ${combo.label}. Settings auto-saved.`});
-    }catch(e){attempts.push(`${combo.label}: ${e.message.substring(0,80)}`);}
-  }
-  res.status(400).json({error:'All attempts failed:\n'+attempts.map((a,i)=>(i+1)+'. '+a).join('\n')});
 }));
 
-/* Send a test email to admin */
 app.post('/api/admin/smtp/test-send', auth, adminOnly, wrap(async(req,res)=>{
+  // Alias to the test route
+  req.url='/api/admin/smtp/test';
   const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
-  if(!rows.length) return res.status(400).json({error:'No email settings saved yet.'});
+  if(!rows.length) return res.status(400).json({error:'Not configured'});
   const cfg=rows[0];
   const[ur]=await pool.query('SELECT email,full_name FROM users WHERE id=?',[req.user.id]);
-  if(!ur.length) return res.status(404).json({error:'Admin user not found'});
+  if(!ur.length) return res.status(404).json({error:'User not found'});
   const u=ur[0];
-  if(!u.email) return res.status(400).json({error:'Admin has no email address set'});
-  const tr=await getTransporter();
-  if(!tr) return res.status(400).json({error:'Could not create email transporter'});
+  const fromName=cfg.from_name||'CloudCraft';
+  const fromAddr=cfg.from_email||cfg.username||u.email;
   try{
-    const info=await tr.sendMail({
-      from:`"${cfg.from_name||'CloudCraft'}" <${cfg.from_email||cfg.username}>`,
-      to: u.email,
-      subject: 'CloudCraft Workspace — Email Test ✓',
-      html:`<div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:24px;">
-        <h2 style="color:#5B8AF0;">CloudCraft Workspace</h2>
-        <p>Hi <b>${u.full_name}</b>,</p>
-        <p>This is a test email confirming your email notifications are configured correctly.</p>
-        <p style="color:#6b7280;font-size:13px;">Sent from: ${cfg.username}<br/>Server: ${cfg.host}:${cfg.port}</p>
-      </div>`
-    });
-    res.json({success:true,message:`Test email sent to ${u.email} (Message-ID: ${info.messageId})`});
-  }catch(e){
-    res.status(400).json({error:`Send failed: ${e.message}`});
-  }
+    await sendEmailAPI({to:u.email,toName:u.full_name,subject:'CloudCraft — Test Email',
+      html:'<p>Hi '+u.full_name+',</p><p>Email is working! Sent via '+(cfg.host||'?')+'.</p>'});
+    res.json({success:true,message:'Test email sent to '+u.email});
+  }catch(e){res.status(400).json({error:e.message});}
 }));
 
-app.use((err,req,res,next)=>res.status(500).json({error:'Internal server error'}));
-const PORT=process.env.PORT||3001;
-setupDatabase().then(()=>app.listen(PORT,'0.0.0.0',()=>console.log(`🚀 Synapse API on port ${PORT}`)));
+
