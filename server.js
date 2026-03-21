@@ -1349,33 +1349,53 @@ app.get('/api/admin/stats', auth, adminOnly, wrap(async(req,res)=>{
 ══════════════════════════════════════ */
 
 /* Build a nodemailer transporter from stored config */
+/* Build transporter from config — resolves IP→hostname automatically */
+function buildTransport(cfg, overridePort, overrideSecure){
+  const port  = overridePort   !== undefined ? overridePort   : parseInt(cfg.port)||587;
+  const secure= overrideSecure !== undefined ? overrideSecure : cfg.encryption==='ssl';
+  return nodemailer.createTransport({
+    host:  cfg.host,
+    port,
+    secure,
+    requireTLS: !secure && port===587,
+    connectionTimeout: 15000,
+    greetingTimeout:   10000,
+    socketTimeout:     15000,
+    auth:{ user:cfg.username, pass:cfg.password },
+    tls:{ rejectUnauthorized:false }
+  });
+}
+
+function isGmailHost(h){
+  return h==='smtp.gmail.com'||h==='gmail'||
+         (h||'').includes('gmail.com');
+}
+
 async function getTransporter(){
   const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
   if(!rows.length) return null;
   const cfg=rows[0];
   if(!cfg.username||!cfg.password) return null;
 
-  // Gmail: always use explicit host/port/tls (more reliable than service:'gmail')
-  if(cfg.host==='smtp.gmail.com'||cfg.host==='gmail'){
+  // Resolve IP to hostname (Railway blocks raw-IP SMTP)
+  const isIP=/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(cfg.host);
+  if(isIP){
+    const domain=(cfg.username.split('@')[1]||'');
+    if(domain) cfg.host='mail.'+domain;
+  }
+
+  // Gmail: use service shortcut (nodemailer handles port/SSL automatically)
+  if(isGmailHost(cfg.host)||cfg.username.endsWith('@gmail.com')||cfg.username.endsWith('@googlemail.com')){
     return nodemailer.createTransport({
-      host:'smtp.gmail.com',
-      port:587,
-      secure:false,          // STARTTLS on port 587
-      requireTLS:true,
+      service:'gmail',
       auth:{user:cfg.username, pass:cfg.password},
-      tls:{rejectUnauthorized:false}
+      connectionTimeout:20000,
+      greetingTimeout:15000,
+      socketTimeout:20000,
     });
   }
 
-  // Generic SMTP
-  return nodemailer.createTransport({
-    host:cfg.host,
-    port:parseInt(cfg.port)||587,
-    secure:cfg.encryption==='ssl',
-    requireTLS:cfg.encryption==='tls',
-    auth:{user:cfg.username, pass:cfg.password},
-    tls:{rejectUnauthorized:false}
-  });
+  return buildTransport(cfg);
 }
 
 /* In-app notification + optional email */
@@ -1479,18 +1499,101 @@ app.put('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
 
 app.post('/api/admin/smtp/test', auth, adminOnly, wrap(async(req,res)=>{
   const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
-  if(!rows.length) return res.status(400).json({error:'No email settings saved yet.'});
-  const cfg=rows[0];
-  if(!cfg.username||!cfg.password) return res.status(400).json({error:'Username or password missing in saved config.'});
-  const tr=await getTransporter();
-  if(!tr) return res.status(400).json({error:'Could not create transporter — check settings.'});
-  try{
-    await tr.verify();
-    res.json({success:true,message:`✓ Connected to ${cfg.host} as ${cfg.username}`});
-  }catch(e){
-    // Return the actual SMTP error so admin knows what to fix
-    res.status(400).json({error:`SMTP Error: ${e.message}`});
+  if(!rows.length) return res.status(400).json({error:'No email settings saved yet. Please save your Gmail address and App Password first.'});
+  const cfg={...rows[0]};
+  if(!cfg.username) return res.status(400).json({error:'Email address not set. Please save settings first.'});
+  if(!cfg.password) return res.status(400).json({error:'Password not saved. Please enter your App Password and click Save Settings first.'});
+
+  const isGmail=isGmailHost(cfg.host)||cfg.username.endsWith('@gmail.com')||cfg.username.endsWith('@googlemail.com');
+
+  if(isGmail){
+    // Gmail: try service shortcut first (most reliable on all Node versions)
+    const gmailCombos=[
+      // Nodemailer service shortcut
+      ()=>nodemailer.createTransport({service:'gmail',auth:{user:cfg.username,pass:cfg.password},connectionTimeout:20000,socketTimeout:20000}),
+      // Explicit 465 SSL
+      ()=>nodemailer.createTransport({host:'smtp.gmail.com',port:465,secure:true,auth:{user:cfg.username,pass:cfg.password},connectionTimeout:20000,socketTimeout:20000,tls:{rejectUnauthorized:false}}),
+      // Explicit 587 TLS
+      ()=>nodemailer.createTransport({host:'smtp.gmail.com',port:587,secure:false,requireTLS:true,auth:{user:cfg.username,pass:cfg.password},connectionTimeout:20000,socketTimeout:20000,tls:{rejectUnauthorized:false}}),
+    ];
+    const labels=['Gmail service shortcut','smtp.gmail.com:465 SSL','smtp.gmail.com:587 TLS'];
+    const attempts=[];
+    for(let i=0;i<gmailCombos.length;i++){
+      try{
+        const tr=gmailCombos[i]();
+        await tr.verify();
+        // Save working config
+        const port=i===0?587:i===1?465:587;
+        const enc=i===1?'ssl':'tls';
+        await pool.query('UPDATE smtp_config SET host=?,port=?,encryption=? WHERE id=?',['smtp.gmail.com',port,enc,cfg.id]);
+        return res.json({success:true,message:`✓ Gmail connected via ${labels[i]}!
+
+Your email is working correctly. Settings saved.`});
+      }catch(e){
+        const isTimeout=e.message.toLowerCase().includes('timeout')||e.message.toLowerCase().includes('connect');
+        const isAuth=e.message.toLowerCase().includes('auth')||e.message.toLowerCase().includes('535')||e.message.toLowerCase().includes('534')||e.message.toLowerCase().includes('username and password');
+        attempts.push({label:labels[i],error:e.message,isTimeout,isAuth});
+      }
+    }
+    // Diagnose the most likely issue
+    const hasAuth=attempts.some(a=>a.isAuth);
+    const allTimeout=attempts.every(a=>a.isTimeout);
+    let diagnosis='';
+    if(hasAuth){
+      diagnosis=`
+
+⚠️ AUTHENTICATION FAILED — Wrong App Password
+`+
+        `Your Gmail address is correct but the password was rejected.
+
+`+
+        `Fix:
+`+
+        `1. Go to myaccount.google.com
+`+
+        `2. Security → 2-Step Verification (must be ON)
+`+
+        `3. Security → App passwords
+`+
+        `4. Create: App=Mail, Device=Other (name: CloudCraft)
+`+
+        `5. Copy the 16-char code (e.g. abcd efgh ijkl mnop)
+`+
+        `6. Paste it in the App Password field and Save Settings again`;
+    } else if(allTimeout){
+      diagnosis=`
+
+⚠️ CONNECTION TIMEOUT
+`+
+        `Cannot reach Gmail SMTP servers. Possible causes:
+`+
+        `• Outbound SMTP is blocked by your hosting provider
+`+
+        `• If Railway is blocking SMTP, consider using Brevo/SendGrid free tier instead`;
+    }
+    const attemptSummary=attempts.map((a,i)=>(i+1)+'. '+a.label+': '+a.error.substring(0,100)).join('\n');
+    return res.status(400).json({error:'Gmail connection failed:\n'+attemptSummary+diagnosis});
   }
+
+  // Non-Gmail: try saved config + fallbacks
+  const isIP=/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(cfg.host);
+  let resolvedHost=isIP?('mail.'+(cfg.username.split('@')[1]||cfg.host)):cfg.host;
+  const combos=[
+    {host:resolvedHost,port:parseInt(cfg.port)||587,secure:cfg.encryption==='ssl',label:`${resolvedHost}:${cfg.port}`},
+    {host:resolvedHost,port:465,secure:true,label:`${resolvedHost}:465 SSL`},
+    {host:resolvedHost,port:587,secure:false,label:`${resolvedHost}:587 TLS`},
+  ];
+  const seen=new Set(),uniq=combos.filter(c=>{const k=`${c.host}:${c.port}:${c.secure}`;if(seen.has(k))return false;seen.add(k);return true;});
+  const attempts=[];
+  for(const combo of uniq){
+    try{
+      const tr=nodemailer.createTransport({host:combo.host,port:combo.port,secure:combo.secure,requireTLS:!combo.secure&&combo.port===587,connectionTimeout:15000,greetingTimeout:10000,socketTimeout:15000,auth:{user:cfg.username,pass:cfg.password},tls:{rejectUnauthorized:false}});
+      await tr.verify();
+      await pool.query('UPDATE smtp_config SET host=?,port=?,encryption=? WHERE id=?',[combo.host,combo.port,combo.secure?'ssl':(combo.port===587?'tls':'none'),cfg.id]);
+      return res.json({success:true,message:`✓ Connected via ${combo.label}. Settings auto-saved.`});
+    }catch(e){attempts.push(`${combo.label}: ${e.message.substring(0,80)}`);}
+  }
+  res.status(400).json({error:'All attempts failed:\n'+attempts.map((a,i)=>(i+1)+'. '+a).join('\n')});
 }));
 
 /* Send a test email to admin */
