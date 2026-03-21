@@ -353,6 +353,20 @@ app.delete('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
   res.json({success:true});
 }));
 
+/* Permanent hard-delete — removes employee + all attendance records */
+app.delete('/api/users/:id/permanent', auth, adminOnly, wrap(async(req,res)=>{
+  const uid=parseInt(req.params.id);
+  if(uid===req.user.id) return res.status(400).json({error:'Cannot delete yourself'});
+  // Check they are not the only admin
+  const[admins]=await pool.query("SELECT id FROM users WHERE role='admin' AND is_active=1");
+  const[target]=await pool.query('SELECT role FROM users WHERE id=?',[uid]);
+  if(target[0]?.role==='admin'&&admins.length<=1)
+    return res.status(400).json({error:'Cannot delete the last admin account'});
+  // Hard delete — cascades to attendance, task_assignees, notifications etc
+  await pool.query('DELETE FROM users WHERE id=?',[uid]);
+  res.json({success:true});
+}));
+
 /* ══════════════════════════════════════
    TASKS — Core CRUD
 ══════════════════════════════════════ */
