@@ -1053,7 +1053,9 @@ app.get('/api/leave/my', auth, wrap(async(req,res)=>{
 
 /* ── Admin/Supervisor: all applications ── */
 app.get('/api/admin/leave', auth, adminOrSupervisor, wrap(async(req,res)=>{
-  const{status,year,month,user_id}=req.query;
+  const{status,year,user_id}=req.query;
+  // NOTE: No month filter — leave applications are managed by YEAR only.
+  // A leave submitted in Jan with April dates should show in the year view.
   const y=parseInt(year)||new Date().getFullYear();
   let sql=`SELECT la.*,
     u.full_name,u.username,u.avatar_color,u.employee_category,u.department,
@@ -1061,9 +1063,9 @@ app.get('/api/admin/leave', auth, adminOrSupervisor, wrap(async(req,res)=>{
     FROM leave_applications la
     JOIN users u ON la.user_id=u.id
     LEFT JOIN users rv ON la.reviewed_by=rv.id
-    WHERE YEAR(la.start_date)=?`;
-  const params=[y];
-  if(month){sql+=' AND MONTH(la.start_date)=?';params.push(parseInt(month));}
+    WHERE la.user_id IS NOT NULL
+    AND (YEAR(la.start_date)=? OR YEAR(la.end_date)=? OR YEAR(la.created_at)=?)`;
+  const params=[y,y,y];
   if(status){sql+=' AND la.status=?';params.push(status);}
   if(user_id){sql+=' AND la.user_id=?';params.push(user_id);}
   sql+=' ORDER BY la.created_at DESC';
@@ -1084,7 +1086,8 @@ app.get('/api/admin/leave', auth, adminOrSupervisor, wrap(async(req,res)=>{
 
   const[summary]=await pool.query(
     `SELECT leave_type,status,COUNT(*) as count FROM leave_applications
-     WHERE YEAR(start_date)=? GROUP BY leave_type,status`,[y]);
+     WHERE (YEAR(start_date)=? OR YEAR(end_date)=? OR YEAR(created_at)=?)
+     GROUP BY leave_type,status`,[y,y,y]);
 
   res.json({applications:rows,summary,year:y});
 }));
