@@ -912,251 +912,263 @@ app.post('/api/admin/users/:id/reset-password', auth, adminOnly, wrap(async(req,
 }));
 
 /* ══════════════════════════════════════
-   LEAVE APPLICATIONS
+   LEAVE APPLICATIONS  — v5
+   Annual leave requires ALL supervisors
+   to individually approve before final
+   status becomes 'approved'.
 ══════════════════════════════════════ */
 
 const LEAVE_CONFIG = {
-  medical:   { days_allowed:12, requires_reason:false, label:'Medical Leave',   needs_all_supervisors:false },
-  emergency: { days_allowed:6,  requires_reason:true,  label:'Emergency Leave', needs_all_supervisors:false },
-  annual:    { days_allowed:14, requires_reason:false,  label:'Annual Leave',    needs_all_supervisors:true  },
-  half_day:  { days_allowed:99, requires_reason:true,  label:'Half Day',        needs_all_supervisors:false },
-  others:    { days_allowed:5,  requires_reason:true,  label:'Other Leave',     needs_all_supervisors:false },
+  medical:   { days:12,  reason:false, label:'Medical Leave',   allSupervisors:false },
+  emergency: { days:6,   reason:true,  label:'Emergency Leave', allSupervisors:false },
+  annual:    { days:14,  reason:false, label:'Annual Leave',    allSupervisors:true  },
+  half_day:  { days:99,  reason:true,  label:'Half Day',        allSupervisors:false },
+  others:    { days:5,   reason:true,  label:'Other Leave',     allSupervisors:false },
 };
 
-/* Helper: seed leave_approvals rows for all active supervisors */
-async function seedLeaveApprovals(leaveId){
-  const[supervisors]=await pool.query(
+/* Ensure every active supervisor has an approval row for this leave */
+async function ensureApprovalRows(leaveId){
+  const[sups]=await pool.query(
     "SELECT id FROM users WHERE role='supervisor' AND is_active=1");
-  for(const sup of supervisors){
+  for(const sup of sups){
     await pool.query(
-      'INSERT IGNORE INTO leave_approvals(leave_id,supervisor_id) VALUES(?,?)',
-      [leaveId,sup.id]).catch(()=>{});
+      'INSERT IGNORE INTO leave_approvals(leave_id,supervisor_id,decision) VALUES(?,?,?)',
+      [leaveId, sup.id, 'pending']).catch(()=>{});
   }
-  return supervisors.length;
+  return sups.length;
 }
 
-/* Helper: check if all supervisors have approved → auto-approve the leave */
-async function checkAndFinaliseLeave(leaveId){
-  const[rows]=await pool.query('SELECT * FROM leave_applications WHERE id=?',[leaveId]);
-  if(!rows.length) return;
-  const leave=rows[0];
-  if(leave.status!=='pending') return; // already decided
+/* After each supervisor decision, check if we can finalise */
+async function tryFinalise(leaveId){
+  const[[leave]]=await pool.query(
+    'SELECT * FROM leave_applications WHERE id=?',[leaveId]);
+  if(!leave||leave.status!=='pending') return; // already done
 
-  const[approvals]=await pool.query(
+  const[rows]=await pool.query(
     'SELECT * FROM leave_approvals WHERE leave_id=?',[leaveId]);
 
-  // If any supervisor rejected → reject the whole application
-  const rejected=approvals.find(a=>a.decision==='rejected');
-  if(rejected){
+  if(!rows.length) return; // no supervisors exist yet
+
+  // Any rejection → reject immediately
+  const rej = rows.find(r=>r.decision==='rejected');
+  if(rej){
     await pool.query(
-      `UPDATE leave_applications SET status='rejected',reviewed_by=?,reviewed_at=NOW() WHERE id=?`,
-      [rejected.supervisor_id,leaveId]);
+      "UPDATE leave_applications SET status='rejected',reviewed_by=?,reviewed_at=NOW() WHERE id=?",
+      [rej.supervisor_id, leaveId]);
     return;
   }
 
-  // Check all supervisors have approved
-  const allApproved=approvals.length>0&&approvals.every(a=>a.decision==='approved');
-  if(allApproved){
-    // Also needs admin to have approved (or admin_override set) for annual leave
-    const[[adminApproval]]=await pool.query(
-      "SELECT COUNT(*) as cnt FROM leave_approvals la JOIN users u ON la.supervisor_id=u.id WHERE la.leave_id=? AND u.role='admin' AND la.decision='approved'",
-      [leaveId]);
-    // For annual leave we only require supervisors; admins can override separately
+  // All must have approved (none still pending)
+  const allDone  = rows.every(r=>r.decision!=='pending');
+  const allApproved = rows.every(r=>r.decision==='approved');
+
+  if(allDone && allApproved){
+    // Find who gave the last approval to set as reviewer
+    const last = rows.sort((a,b)=>new Date(b.decided_at)-new Date(a.decided_at))[0];
     await pool.query(
-      `UPDATE leave_applications SET status='approved',reviewed_at=NOW() WHERE id=?`,
-      [leaveId]);
+      "UPDATE leave_applications SET status='approved',reviewed_by=?,reviewed_at=NOW() WHERE id=?",
+      [last.supervisor_id, leaveId]);
   }
 }
 
-/* Submit leave application */
+/* ── Submit leave ── */
 app.post('/api/leave', auth, wrap(async(req,res)=>{
-  if(req.user.role==='admin') return res.status(403).json({error:'Administrators use the admin override feature for leave management.'});
-  const{leave_type,start_date,end_date,reason,half_day_period,half_day_start,half_day_end}=req.body;
+  if(req.user.role==='admin')
+    return res.status(403).json({error:'Admins use the override feature for leave.'});
 
-  if(!leave_type||!start_date||!end_date) return res.status(400).json({error:'Leave type and dates are required'});
-  if(!LEAVE_CONFIG[leave_type]) return res.status(400).json({error:'Invalid leave type'});
+  const{leave_type,start_date,end_date,reason,
+        half_day_period,half_day_start,half_day_end}=req.body;
 
-  if(LEAVE_CONFIG[leave_type].requires_reason&&!reason?.trim())
-    return res.status(400).json({error:`A reason is required for ${LEAVE_CONFIG[leave_type].label}`});
+  const cfg = LEAVE_CONFIG[leave_type];
+  if(!cfg) return res.status(400).json({error:'Invalid leave type'});
+  if(!start_date||!end_date) return res.status(400).json({error:'Dates required'});
+  if(cfg.reason&&!reason?.trim())
+    return res.status(400).json({error:`Reason required for ${cfg.label}`});
 
   if(leave_type==='half_day'){
-    if(!half_day_period) return res.status(400).json({error:'Please select Morning or Afternoon for half day'});
-    if(!half_day_start||!half_day_end) return res.status(400).json({error:'Start and end time required for half day leave'});
-    if(start_date!==end_date) return res.status(400).json({error:'Half day leave must be a single day'});
+    if(!half_day_period)        return res.status(400).json({error:'Select Morning or Afternoon'});
+    if(!half_day_start||!half_day_end) return res.status(400).json({error:'Time range required'});
+    if(start_date!==end_date)   return res.status(400).json({error:'Half day must be a single day'});
   }
 
   const[overlap]=await pool.query(
-    `SELECT id FROM leave_applications WHERE user_id=? AND status!='rejected' AND NOT(end_date<? OR start_date>?)`,
+    "SELECT id FROM leave_applications WHERE user_id=? AND status!='rejected' AND NOT(end_date<? OR start_date>?)",
     [req.user.id,start_date,end_date]);
-  if(overlap.length) return res.status(400).json({error:'You already have a leave covering this date range'});
+  if(overlap.length)
+    return res.status(400).json({error:'You already have a leave covering this period'});
 
   const[r]=await pool.query(
-    `INSERT INTO leave_applications(user_id,leave_type,start_date,end_date,reason,half_day_period,half_day_start,half_day_end)
+    `INSERT INTO leave_applications
+      (user_id,leave_type,start_date,end_date,reason,half_day_period,half_day_start,half_day_end)
      VALUES(?,?,?,?,?,?,?,?)`,
-    [req.user.id,leave_type,start_date,end_date,reason?.trim()||'',
-     half_day_period||null,half_day_start||null,half_day_end||null]);
+    [req.user.id,leave_type,start_date,end_date,
+     reason?.trim()||'',half_day_period||null,half_day_start||null,half_day_end||null]);
 
-  const leaveId=r.insertId;
+  const leaveId = r.insertId;
+  let supCount  = 0;
 
-  // For annual leave: seed an approval row for every active supervisor
-  let supervisorCount=0;
-  if(LEAVE_CONFIG[leave_type].needs_all_supervisors){
-    supervisorCount=await seedLeaveApprovals(leaveId);
+  if(cfg.allSupervisors){
+    supCount = await ensureApprovalRows(leaveId);
   }
 
-  const msg=LEAVE_CONFIG[leave_type].needs_all_supervisors
-    ? `Annual leave submitted — requires approval from all ${supervisorCount} supervisor(s)`
-    : 'Leave application submitted — awaiting supervisor approval';
+  const msg = cfg.allSupervisors
+    ? `Annual leave submitted — requires approval from all ${supCount} supervisor(s)`
+    : 'Leave submitted — awaiting approval';
 
-  res.json({success:true,id:leaveId,message:msg,needs_all_supervisors:LEAVE_CONFIG[leave_type].needs_all_supervisors});
+  res.json({success:true, id:leaveId, message:msg});
 }));
 
-/* My leave applications — with per-supervisor approval status for annual leave */
+/* ── My applications ── */
 app.get('/api/leave/my', auth, wrap(async(req,res)=>{
-  const{year}=req.query;
-  const y=parseInt(year)||new Date().getFullYear();
+  const y=parseInt(req.query.year)||new Date().getFullYear();
   const[rows]=await pool.query(`
-    SELECT la.*,u.full_name as reviewer_name,u.avatar_color as reviewer_color
+    SELECT la.*,rv.full_name as reviewer_name,rv.avatar_color as reviewer_color
     FROM leave_applications la
-    LEFT JOIN users u ON la.reviewed_by=u.id
+    LEFT JOIN users rv ON la.reviewed_by=rv.id
     WHERE la.user_id=? AND YEAR(la.start_date)=?
     ORDER BY la.created_at DESC`,[req.user.id,y]);
 
-  // For annual leave rows, also fetch per-supervisor decisions
   for(const row of rows){
-    if(LEAVE_CONFIG[row.leave_type]?.needs_all_supervisors){
+    if(LEAVE_CONFIG[row.leave_type]?.allSupervisors){
+      await ensureApprovalRows(row.id); // ensure rows exist even for old applications
       const[approvals]=await pool.query(`
         SELECT la.decision,la.note,la.decided_at,
           u.full_name as supervisor_name,u.avatar_color,u.id as supervisor_id
         FROM leave_approvals la
         JOIN users u ON la.supervisor_id=u.id
-        WHERE la.leave_id=?
-        ORDER BY u.full_name`,[row.id]);
+        WHERE la.leave_id=? ORDER BY u.full_name`,[row.id]);
       row.supervisor_approvals=approvals;
     }
   }
 
+  // Usage summary
   const usage={};
-  for(const[type,cfg] of Object.entries(LEAVE_CONFIG)){
-    const used=rows.filter(r=>r.leave_type===type&&r.status==='approved')
-      .reduce((sum,r)=>{
-        if(r.leave_type==='half_day') return sum+0.5;
-        const d1=new Date(r.start_date),d2=new Date(r.end_date);
-        return sum+Math.round((d2-d1)/86400000)+1;
-      },0);
-    usage[type]={used,allowed:cfg.days_allowed,label:cfg.label};
+  for(const[t,cfg] of Object.entries(LEAVE_CONFIG)){
+    const used=rows.filter(r=>r.leave_type===t&&r.status==='approved')
+      .reduce((sum,r)=>sum+(t==='half_day'?0.5:Math.round((new Date(r.end_date)-new Date(r.start_date))/86400000)+1),0);
+    usage[t]={used,allowed:cfg.days,label:cfg.label};
   }
   res.json({applications:rows,usage,year:y});
 }));
 
-/* Admin/Supervisor: all leave applications with supervisor_approvals for annual */
+/* ── Admin/Supervisor: all applications ── */
 app.get('/api/admin/leave', auth, adminOrSupervisor, wrap(async(req,res)=>{
   const{status,year,month,user_id}=req.query;
   const y=parseInt(year)||new Date().getFullYear();
   let sql=`SELECT la.*,
     u.full_name,u.username,u.avatar_color,u.employee_category,u.department,
-    rv.full_name as reviewer_name,rv.avatar_color as reviewer_color,rv.role as reviewer_role
+    rv.full_name as reviewer_name,rv.avatar_color as reviewer_color
     FROM leave_applications la
     JOIN users u ON la.user_id=u.id
     LEFT JOIN users rv ON la.reviewed_by=rv.id
     WHERE YEAR(la.start_date)=?`;
   const params=[y];
   if(month){sql+=' AND MONTH(la.start_date)=?';params.push(parseInt(month));}
-  if(status==='pending'){
-    sql+=" AND la.status='pending'";
-  } else if(status){
-    sql+=' AND la.status=?';params.push(status);
-  }
+  if(status){sql+=' AND la.status=?';params.push(status);}
   if(user_id){sql+=' AND la.user_id=?';params.push(user_id);}
   sql+=' ORDER BY la.created_at DESC';
   const[rows]=await pool.query(sql,params);
 
-  // Attach per-supervisor approvals for annual leave rows
   for(const row of rows){
-    if(LEAVE_CONFIG[row.leave_type]?.needs_all_supervisors){
+    if(LEAVE_CONFIG[row.leave_type]?.allSupervisors){
+      await ensureApprovalRows(row.id); // backfill rows for old applications
       const[approvals]=await pool.query(`
         SELECT la.decision,la.note,la.decided_at,
           u.full_name as supervisor_name,u.avatar_color,u.id as supervisor_id,u.role
         FROM leave_approvals la
         JOIN users u ON la.supervisor_id=u.id
-        WHERE la.leave_id=?
-        ORDER BY u.full_name`,[row.id]);
+        WHERE la.leave_id=? ORDER BY u.full_name`,[row.id]);
       row.supervisor_approvals=approvals;
     }
   }
 
   const[summary]=await pool.query(
-    `SELECT leave_type,status,COUNT(*) as count FROM leave_applications WHERE YEAR(start_date)=? GROUP BY leave_type,status`,[y]);
+    `SELECT leave_type,status,COUNT(*) as count FROM leave_applications
+     WHERE YEAR(start_date)=? GROUP BY leave_type,status`,[y]);
 
   res.json({applications:rows,summary,year:y});
 }));
 
-/* Supervisor approves/rejects a leave — for annual leave updates their row in leave_approvals */
+/* ── Supervisor/Admin approve or reject ── */
 app.put('/api/admin/leave/:id', auth, adminOrSupervisor, wrap(async(req,res)=>{
   const{status,reviewer_note,admin_override}=req.body;
-  const id=req.params.id;
-  if(!['approved','rejected'].includes(status)) return res.status(400).json({error:'Invalid status'});
+  const id=parseInt(req.params.id);
+  if(!['approved','rejected'].includes(status))
+    return res.status(400).json({error:'Invalid status'});
 
-  const[rows]=await pool.query('SELECT * FROM leave_applications WHERE id=?',[id]);
-  if(!rows.length) return res.status(404).json({error:'Application not found'});
-  const app_=rows[0];
+  const[[leave]]=await pool.query('SELECT * FROM leave_applications WHERE id=?',[id]);
+  if(!leave) return res.status(404).json({error:'Application not found'});
 
-  if(req.user.role==='supervisor'&&app_.user_id===req.user.id)
+  // Supervisors cannot approve their own leave
+  if(req.user.role==='supervisor'&&leave.user_id===req.user.id)
     return res.status(403).json({error:'You cannot approve your own leave application'});
 
-  const needsAll=LEAVE_CONFIG[app_.leave_type]?.needs_all_supervisors;
+  const cfg = LEAVE_CONFIG[leave.leave_type];
 
-  if(needsAll && req.user.role==='supervisor'){
-    // Record this supervisor's individual decision
+  if(cfg?.allSupervisors && req.user.role==='supervisor'){
+    // ── Annual leave: record this supervisor's individual decision ──
+    // Make sure the row exists first
     await pool.query(
-      `UPDATE leave_approvals SET decision=?,note=?,decided_at=NOW() WHERE leave_id=? AND supervisor_id=?`,
-      [status,reviewer_note||null,id,req.user.id]);
-    // Check if we should finalise now
-    await checkAndFinaliseLeave(id);
-    res.json({success:true,message:status==='approved'
-      ?'Your approval recorded. Application finalised when all supervisors approve.'
-      :'You have rejected this leave. Application is now rejected.'});
+      'INSERT IGNORE INTO leave_approvals(leave_id,supervisor_id,decision) VALUES(?,?,?)',
+      [id, req.user.id, 'pending']).catch(()=>{});
+
+    const affected = await pool.query(
+      `UPDATE leave_approvals SET decision=?,note=?,decided_at=NOW()
+       WHERE leave_id=? AND supervisor_id=?`,
+      [status, reviewer_note||null, id, req.user.id]);
+
+    // Re-check and finalise
+    await tryFinalise(id);
+
+    res.json({success:true, message: status==='approved'
+      ? 'Your approval recorded. Leave will be approved once all supervisors approve.'
+      : 'Leave application rejected.'});
+
   } else {
-    // Non-annual leave OR admin action: direct approval
+    // ── Direct decision: admin override OR non-annual leave ──
     await pool.query(
-      `UPDATE leave_applications SET status=?,reviewed_by=?,reviewed_at=NOW(),reviewer_note=?,admin_override=? WHERE id=?`,
-      [status,req.user.id,reviewer_note||null,req.user.role==='admin'&&admin_override?1:0,id]);
+      `UPDATE leave_applications
+       SET status=?,reviewed_by=?,reviewed_at=NOW(),reviewer_note=?,admin_override=?
+       WHERE id=?`,
+      [status, req.user.id, reviewer_note||null,
+       req.user.role==='admin'&&admin_override?1:0, id]);
 
     if(status==='approved'){
-      const start=new Date(app_.start_date+'T12:00:00'),end=new Date(app_.end_date+'T12:00:00');
-      for(let d=new Date(start);d<=end;d.setDate(d.getDate()+1)){
+      const s=new Date(leave.start_date+'T12:00:00'),e=new Date(leave.end_date+'T12:00:00');
+      for(let d=new Date(s);d<=e;d.setDate(d.getDate()+1)){
         await pool.query(
-          `UPDATE attendance SET admin_note=CONCAT(COALESCE(admin_note,''),' [On Approved Leave]') WHERE user_id=? AND work_date=?`,
-          [app_.user_id,localDate(d)]).catch(()=>{});
+          "UPDATE attendance SET admin_note=CONCAT(COALESCE(admin_note,''),' [On Approved Leave]') WHERE user_id=? AND work_date=?",
+          [leave.user_id,localDate(d)]).catch(()=>{});
       }
     }
     res.json({success:true});
   }
 }));
 
-/* Admin force-override */
+/* ── Admin force-override (bypasses supervisor chain) ── */
 app.post('/api/admin/leave/:id/override', auth, adminOnly, wrap(async(req,res)=>{
   const{status,reviewer_note}=req.body;
-  const id=req.params.id;
   if(!status) return res.status(400).json({error:'Status required'});
   await pool.query(
-    `UPDATE leave_applications SET status=?,reviewed_by=?,reviewed_at=NOW(),reviewer_note=?,admin_override=1 WHERE id=?`,
-    [status,req.user.id,reviewer_note||'Admin override',id]);
+    `UPDATE leave_applications SET status=?,reviewed_by=?,reviewed_at=NOW(),
+     reviewer_note=?,admin_override=1 WHERE id=?`,
+    [status, req.user.id, reviewer_note||'Admin override', req.params.id]);
   res.json({success:true});
 }));
 
-/* Delete / withdraw */
+/* ── Delete / withdraw ── */
 app.delete('/api/leave/:id', auth, wrap(async(req,res)=>{
-  const[rows]=await pool.query('SELECT * FROM leave_applications WHERE id=?',[req.params.id]);
-  if(!rows.length) return res.status(404).json({error:'Not found'});
-  const rec=rows[0];
+  const[[rec]]=await pool.query('SELECT * FROM leave_applications WHERE id=?',[req.params.id]);
+  if(!rec) return res.status(404).json({error:'Not found'});
   if(req.user.role!=='admin'){
     if(rec.user_id!==req.user.id) return res.status(403).json({error:'Access denied'});
-    if(rec.status!=='pending') return res.status(400).json({error:'Can only withdraw pending applications'});
+    if(rec.status!=='pending') return res.status(400).json({error:'Only pending applications can be withdrawn'});
   }
   await pool.query('DELETE FROM leave_applications WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
+
+
 /* ══════════════════════════════════════
    ADMIN TASK STATS
 ══════════════════════════════════════ */
