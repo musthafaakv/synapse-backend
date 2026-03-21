@@ -111,6 +111,8 @@ async function setupDatabase(){
       avatar_color VARCHAR(7) DEFAULT '#3B82F6',
       is_active BOOLEAN DEFAULT TRUE,
       must_change_password BOOLEAN DEFAULT FALSE,
+      last_login_at TIMESTAMP NULL,
+      last_login_ip VARCHAR(64) DEFAULT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
 
@@ -250,6 +252,8 @@ async function setupDatabase(){
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN employee_category ENUM('office','field') DEFAULT 'office'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE`).catch(()=>{});
+    await c.query(`ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP NULL`).catch(()=>{});
+    await c.query(`ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(64) DEFAULT NULL`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT ''`).catch(()=>{});
     await c.query(`ALTER TABLE notifications MODIFY COLUMN type VARCHAR(50) DEFAULT 'assigned'`).catch(()=>{});
     await c.query(`ALTER TABLE task_history CHANGE COLUMN changed_by_id user_id INT NOT NULL`).catch(()=>{});
@@ -326,8 +330,14 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
   const token=jwt.sign({id:u.id,username:u.username,role:u.role},JWT_SECRET,{expiresIn:'8h'});
   let permissions={};
   if(u.role==='supervisor'){const[perms]=await pool.query('SELECT * FROM supervisor_permissions WHERE user_id=?',[u.id]);permissions=perms[0]||{};}
+  // Capture real client IP (behind proxies)
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+           || req.headers['x-real-ip']
+           || req.socket?.remoteAddress
+           || 'unknown';
+  pool.query('UPDATE users SET last_login_at=NOW(),last_login_ip=? WHERE id=?',[ip,u.id]).catch(()=>{});
   pool.query('INSERT INTO activity_log(user_id,action,entity_type) VALUES(?,?,?)',[u.id,'login','user']).catch(()=>{});
-  res.json({token,user:{id:u.id,username:u.username,email:u.email,full_name:u.full_name,role:u.role,employee_category:u.employee_category||'office',department:u.department||'',avatar_color:u.avatar_color,permissions,must_change_password:u.must_change_password?true:false}});
+  res.json({token,user:{id:u.id,username:u.username,email:u.email,full_name:u.full_name,role:u.role,employee_category:u.employee_category||'office',department:u.department||'',avatar_color:u.avatar_color,permissions,must_change_password:u.must_change_password?true:false,last_login_at:u.last_login_at,last_login_ip:u.last_login_ip}});
 }));
 
 /* ══════════════════════════════════════
@@ -336,7 +346,7 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
 app.get('/api/users', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(`
     SELECT u.id,u.username,u.email,u.full_name,u.role,u.employee_category,u.department,
-      u.avatar_color,u.is_active,u.must_change_password,u.created_at,
+      u.avatar_color,u.is_active,u.must_change_password,u.last_login_at,u.last_login_ip,u.created_at,
       sp.can_approve_attendance,sp.can_view_all_attendance,sp.can_edit_tasks,
       sp.can_create_tasks,sp.can_view_all_tasks,sp.can_manage_holidays
     FROM users u LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id ORDER BY u.full_name`);
@@ -880,6 +890,34 @@ app.post('/api/admin/holidays', auth, adminOrSupervisor, wrap(async(req,res)=>{
 app.delete('/api/admin/holidays/:date', auth, adminOnly, wrap(async(req,res)=>{
   await pool.query('DELETE FROM holidays WHERE holiday_date=? AND type!=?',[req.params.date,'sunday']);
   res.json({success:true});
+}));
+
+/* ══════════════════════════════════════
+   ADMIN SELF-SERVICE ACCOUNT ROUTES
+══════════════════════════════════════ */
+/* Get current admin's own full info including login history */
+app.get('/api/auth/me', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT id,username,email,full_name,role,avatar_color,last_login_at,last_login_ip,must_change_password,created_at FROM users WHERE id=?',
+    [req.user.id]);
+  if(!rows.length) return res.status(404).json({error:'Not found'});
+  res.json(rows[0]);
+}));
+
+/* Admin updates own email */
+app.put('/api/auth/change-email', auth, adminOnly, wrap(async(req,res)=>{
+  const{email,password}=req.body;
+  if(!email?.trim()) return res.status(400).json({error:'Email required'});
+  // Verify current password
+  const[rows]=await pool.query('SELECT password_hash FROM users WHERE id=?',[req.user.id]);
+  if(!rows.length) return res.status(404).json({error:'User not found'});
+  if(!await bcrypt.compare(password,rows[0].password_hash))
+    return res.status(400).json({error:'Current password incorrect'});
+  // Check unique
+  const[existing]=await pool.query('SELECT id FROM users WHERE email=? AND id!=?',[email.trim(),req.user.id]);
+  if(existing.length) return res.status(400).json({error:'Email already in use'});
+  await pool.query('UPDATE users SET email=? WHERE id=?',[email.trim(),req.user.id]);
+  res.json({success:true,message:'Email updated successfully'});
 }));
 
 /* ══════════════════════════════════════
