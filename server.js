@@ -185,10 +185,13 @@ async function setupDatabase(){
 
     await c.query(`CREATE TABLE IF NOT EXISTS smtp_config(
       id INT AUTO_INCREMENT PRIMARY KEY,
-      host VARCHAR(255) NOT NULL, port INT NOT NULL DEFAULT 587,
-      username VARCHAR(255) NOT NULL, password VARCHAR(255) NOT NULL,
+      host VARCHAR(255) DEFAULT 'smtp.gmail.com',
+      port INT NOT NULL DEFAULT 587,
+      username VARCHAR(255) DEFAULT '',
+      password VARCHAR(255) DEFAULT '',
       encryption ENUM('none','ssl','tls') DEFAULT 'tls',
-      from_email VARCHAR(255), from_name VARCHAR(100),
+      from_email VARCHAR(255) DEFAULT '',
+      from_name VARCHAR(100) DEFAULT 'CloudCraft Workspace',
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
 
     await c.query(`CREATE TABLE IF NOT EXISTS activity_log(
@@ -1439,7 +1442,13 @@ async function notifySupervisors(opts){
 
 app.get('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
   const[r]=await pool.query('SELECT id,host,port,username,encryption,from_email,from_name FROM smtp_config LIMIT 1');
-  res.json(r[0]||{});
+  const cfg=r[0]||{};
+  // Also return whether a password is saved (without revealing it)
+  if(r[0]){
+    const[pw]=await pool.query('SELECT LENGTH(password)>0 as has_password FROM smtp_config WHERE id=?',[r[0].id]);
+    cfg.has_password=pw[0]?.has_password===1;
+  }
+  res.json(cfg);
 }));
 
 app.put('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
@@ -1460,37 +1469,57 @@ app.put('/api/admin/smtp', auth, adminOnly, wrap(async(req,res)=>{
     vals.push(ex[0].id);
     await pool.query(`UPDATE smtp_config SET ${cols.join(',')} WHERE id=?`,vals);
   } else {
-    if(!password||!password.trim())
-      return res.status(400).json({error:'Password/App Password is required for first-time setup'});
+    // First-time insert — password can be blank if they want to configure incrementally
     await pool.query(
       'INSERT INTO smtp_config(host,port,username,password,encryption,from_email,from_name) VALUES(?,?,?,?,?,?,?)',
-      [h,p,username,password.trim(),enc,from_email||username||'',from_name||'CloudCraft']);
+      [h,p,username||'',password?.trim()||'',enc,from_email||username||'',from_name||'CloudCraft Workspace']);
   }
   res.json({success:true});
 }));
 
 app.post('/api/admin/smtp/test', auth, adminOnly, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
+  if(!rows.length) return res.status(400).json({error:'No email settings saved yet.'});
+  const cfg=rows[0];
+  if(!cfg.username||!cfg.password) return res.status(400).json({error:'Username or password missing in saved config.'});
   const tr=await getTransporter();
-  if(!tr) return res.status(400).json({error:'Email not configured. Please save settings first.'});
-  await tr.verify();
-  res.json({success:true,message:'Connection verified! Email is working ✓'});
+  if(!tr) return res.status(400).json({error:'Could not create transporter — check settings.'});
+  try{
+    await tr.verify();
+    res.json({success:true,message:`✓ Connected to ${cfg.host} as ${cfg.username}`});
+  }catch(e){
+    // Return the actual SMTP error so admin knows what to fix
+    res.status(400).json({error:`SMTP Error: ${e.message}`});
+  }
 }));
 
 /* Send a test email to admin */
 app.post('/api/admin/smtp/test-send', auth, adminOnly, wrap(async(req,res)=>{
-  const tr=await getTransporter();
-  if(!tr) return res.status(400).json({error:'Email not configured'});
   const[rows]=await pool.query('SELECT * FROM smtp_config LIMIT 1');
+  if(!rows.length) return res.status(400).json({error:'No email settings saved yet.'});
+  const cfg=rows[0];
   const[ur]=await pool.query('SELECT email,full_name FROM users WHERE id=?',[req.user.id]);
-  if(!ur.length) return res.status(404).json({error:'User not found'});
-  const cfg=rows[0],u=ur[0];
-  await tr.sendMail({
-    from:`"${cfg.from_name||'CloudCraft'}" <${cfg.from_email||cfg.username}>`,
-    to: u.email,
-    subject: 'CloudCraft — Email Test',
-    html: `<p>Hi ${u.full_name},</p><p>Your email notification system is working correctly! ✓</p><p>— CloudCraft Workspace</p>`
-  });
-  res.json({success:true,message:`Test email sent to ${u.email}`});
+  if(!ur.length) return res.status(404).json({error:'Admin user not found'});
+  const u=ur[0];
+  if(!u.email) return res.status(400).json({error:'Admin has no email address set'});
+  const tr=await getTransporter();
+  if(!tr) return res.status(400).json({error:'Could not create email transporter'});
+  try{
+    const info=await tr.sendMail({
+      from:`"${cfg.from_name||'CloudCraft'}" <${cfg.from_email||cfg.username}>`,
+      to: u.email,
+      subject: 'CloudCraft Workspace — Email Test ✓',
+      html:`<div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:24px;">
+        <h2 style="color:#5B8AF0;">CloudCraft Workspace</h2>
+        <p>Hi <b>${u.full_name}</b>,</p>
+        <p>This is a test email confirming your email notifications are configured correctly.</p>
+        <p style="color:#6b7280;font-size:13px;">Sent from: ${cfg.username}<br/>Server: ${cfg.host}:${cfg.port}</p>
+      </div>`
+    });
+    res.json({success:true,message:`Test email sent to ${u.email} (Message-ID: ${info.messageId})`});
+  }catch(e){
+    res.status(400).json({error:`Send failed: ${e.message}`});
+  }
 }));
 
 app.use((err,req,res,next)=>res.status(500).json({error:'Internal server error'}));
