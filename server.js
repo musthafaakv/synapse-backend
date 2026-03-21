@@ -308,6 +308,24 @@ async function setupDatabase(){
       amount DECIMAL(12,2) DEFAULT 0.00,
       FOREIGN KEY(quotation_id) REFERENCES quotations(id) ON DELETE CASCADE)`);
 
+    await c.query(`CREATE TABLE IF NOT EXISTS inventory(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      sku VARCHAR(100) DEFAULT NULL,
+      description TEXT DEFAULT NULL,
+      selling_price DECIMAL(12,2) DEFAULT 0.00,
+      buying_price DECIMAL(12,2) DEFAULT 0.00,
+      vat_rate DECIMAL(5,2) DEFAULT 5.00,
+      unit VARCHAR(50) DEFAULT NULL,
+      stock_qty DECIMAL(10,2) DEFAULT 0.00,
+      is_active TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
+
+    /* Add show_description column to quotation_items if missing */
+    await c.query('ALTER TABLE quotation_items ADD COLUMN show_description TINYINT(1) DEFAULT 1').catch(()=>{});
+    await c.query('ALTER TABLE quotation_items ADD COLUMN inventory_id INT DEFAULT NULL').catch(()=>{});
+
 
     /* Migrations */
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
@@ -1474,6 +1492,36 @@ app.delete('/api/quotations/:id', auth, wrap(async(req,res)=>{
   res.json({success:true});
 }));
 
+
+/* ══════════════════════════════════════
+   INVENTORY
+══════════════════════════════════════ */
+app.get('/api/inventory', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM inventory WHERE is_active=1 ORDER BY name');
+  res.json(rows);
+}));
+
+app.post('/api/inventory', auth, wrap(async(req,res)=>{
+  const{name,sku,description,selling_price,buying_price,vat_rate,unit,stock_qty}=req.body;
+  if(!name) return res.status(400).json({error:'Product name required'});
+  const[r]=await pool.query(
+    'INSERT INTO inventory(name,sku,description,selling_price,buying_price,vat_rate,unit,stock_qty) VALUES(?,?,?,?,?,?,?,?)',
+    [name,sku||null,description||null,selling_price||0,buying_price||0,vat_rate??5,unit||null,stock_qty||0]);
+  res.json({success:true,id:r.insertId});
+}));
+
+app.put('/api/inventory/:id', auth, wrap(async(req,res)=>{
+  const{name,sku,description,selling_price,buying_price,vat_rate,unit,stock_qty}=req.body;
+  await pool.query(
+    'UPDATE inventory SET name=?,sku=?,description=?,selling_price=?,buying_price=?,vat_rate=?,unit=?,stock_qty=?,updated_at=NOW() WHERE id=?',
+    [name,sku||null,description||null,selling_price||0,buying_price||0,vat_rate??5,unit||null,stock_qty||0,req.params.id]);
+  res.json({success:true});
+}));
+
+app.delete('/api/inventory/:id', auth, wrap(async(req,res)=>{
+  await pool.query('UPDATE inventory SET is_active=0 WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
 
 /* ══════════════════════════════════════
    ADMIN TASK STATS
