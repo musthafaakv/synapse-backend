@@ -21,6 +21,77 @@ const pool = mysql.createPool({
 });
 
 /* ══════════════════════════════════════
+   ATTENDANCE RULES
+   All times are compared in HH:MM format (server local time)
+══════════════════════════════════════ */
+const RULES = {
+  office: {
+    // Clock-in window 08:45–09:10 → auto-approved
+    ci_auto_start: '08:45', ci_auto_end: '09:10',
+    // Clock-out window 17:45–18:30 → auto-approved
+    co_auto_start: '17:45', co_auto_end: '18:30',
+  },
+  field: {
+    // On-time: up to 09:35 → auto-approved; after → late+pending
+    ci_ontime_until: '09:15',
+    ci_late_until:   '09:35',   // allowed but auto-approved as on-time up to here
+    ci_late_flag:    '09:35',   // beyond this → flagged late, needs approval
+    // Clock-out: 18:00–19:00 → auto-approved; before 18:00 → early+pending
+    co_early_before: '18:00',
+    co_auto_end:     '19:00',
+  },
+};
+
+function timeHHMM(d){ // extract HH:MM from a Date object
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+}
+function timeGte(a,b){ return a>=b; } // "a >= b" in HH:MM string compare
+function timeLte(a,b){ return a<=b; }
+function timeBetween(t,from,to){ return t>=from && t<=to; }
+
+// Returns {clock_in_status, flag, auto_approved, approved_clock_in}
+function evaluateClockIn(now, category){
+  const t = timeHHMM(now);
+  if(category==='office'){
+    if(timeBetween(t, RULES.office.ci_auto_start, RULES.office.ci_auto_end)){
+      return {clock_in_status:'approved', flag:'on_time', approved_clock_in:now};
+    }
+    return {clock_in_status:'pending', flag: t<RULES.office.ci_auto_start?'early':'late'};
+  }
+  if(category==='field'){
+    if(timeLte(t, RULES.field.ci_late_until)){
+      return {clock_in_status:'approved', flag:'on_time', approved_clock_in:now};
+    }
+    // After 09:35 → late, needs approval
+    return {clock_in_status:'pending', flag:'late'};
+  }
+  // unknown category → pending
+  return {clock_in_status:'pending', flag:'on_time'};
+}
+
+function evaluateClockOut(now, category){
+  const t = timeHHMM(now);
+  if(category==='office'){
+    if(timeBetween(t, RULES.office.co_auto_start, RULES.office.co_auto_end)){
+      return {clock_out_status:'approved', flag:'on_time', approved_clock_out:now};
+    }
+    return {clock_out_status:'pending', flag: t<RULES.office.co_auto_start?'early':'late'};
+  }
+  if(category==='field'){
+    if(t<RULES.field.co_early_before){
+      // Early departure → needs approval
+      return {clock_out_status:'pending', flag:'early'};
+    }
+    if(timeLte(t, RULES.field.co_auto_end)){
+      return {clock_out_status:'approved', flag:'on_time', approved_clock_out:now};
+    }
+    // After 19:00 → pending (very late)
+    return {clock_out_status:'pending', flag:'late'};
+  }
+  return {clock_out_status:'pending', flag:'on_time'};
+}
+
+/* ══════════════════════════════════════
    DATABASE SETUP
 ══════════════════════════════════════ */
 async function setupDatabase(){
@@ -35,6 +106,8 @@ async function setupDatabase(){
       password_hash VARCHAR(255) NOT NULL,
       full_name VARCHAR(100),
       role ENUM('admin','supervisor','member') DEFAULT 'member',
+      employee_category ENUM('office','field') DEFAULT 'office',
+      department VARCHAR(100) DEFAULT '',
       avatar_color VARCHAR(7) DEFAULT '#3B82F6',
       is_active BOOLEAN DEFAULT TRUE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -53,12 +126,10 @@ async function setupDatabase(){
 
     await c.query(`CREATE TABLE IF NOT EXISTS tasks(
       id INT AUTO_INCREMENT PRIMARY KEY,
-      title VARCHAR(255) NOT NULL,
-      description TEXT,
+      title VARCHAR(255) NOT NULL, description TEXT,
       status ENUM('todo','in_progress','review','done') DEFAULT 'todo',
       priority ENUM('low','medium','high','urgent') DEFAULT 'medium',
-      creator_id INT NOT NULL,
-      due_date DATE,
+      creator_id INT NOT NULL, due_date DATE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       FOREIGN KEY(creator_id) REFERENCES users(id) ON DELETE CASCADE)`);
@@ -70,7 +141,6 @@ async function setupDatabase(){
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)`);
 
-    /* task_revoked: users who have moved-away lose all access */
     await c.query(`CREATE TABLE IF NOT EXISTS task_revoked(
       task_id INT NOT NULL, user_id INT NOT NULL,
       revoked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -80,8 +150,7 @@ async function setupDatabase(){
 
     await c.query(`CREATE TABLE IF NOT EXISTS tags(
       id INT AUTO_INCREMENT PRIMARY KEY,
-      name VARCHAR(50) NOT NULL UNIQUE,
-      color VARCHAR(7) DEFAULT '#6366F1')`);
+      name VARCHAR(50) NOT NULL UNIQUE, color VARCHAR(7) DEFAULT '#6366F1')`);
 
     await c.query(`CREATE TABLE IF NOT EXISTS task_tags(
       task_id INT NOT NULL, tag_id INT NOT NULL, PRIMARY KEY(task_id,tag_id),
@@ -91,23 +160,17 @@ async function setupDatabase(){
     await c.query(`CREATE TABLE IF NOT EXISTS notifications(
       id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL,
       task_id INT NOT NULL, triggered_by_id INT NOT NULL,
-      type VARCHAR(50) DEFAULT 'assigned',
-      is_read BOOLEAN DEFAULT FALSE,
+      type VARCHAR(50) DEFAULT 'assigned', is_read BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
       FOREIGN KEY(triggered_by_id) REFERENCES users(id) ON DELETE CASCADE)`);
 
-    /* task_history: immutable timeline of every action on a task */
     await c.query(`CREATE TABLE IF NOT EXISTS task_history(
       id INT AUTO_INCREMENT PRIMARY KEY,
-      task_id INT NOT NULL,
-      user_id INT NOT NULL,
-      action VARCHAR(50) NOT NULL,
-      field VARCHAR(50),
-      old_value TEXT,
-      new_value TEXT,
-      comment TEXT,
+      task_id INT NOT NULL, user_id INT NOT NULL,
+      action VARCHAR(100) NOT NULL, field VARCHAR(50),
+      old_value TEXT, new_value TEXT, comment TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)`);
@@ -132,6 +195,8 @@ async function setupDatabase(){
       clock_in DATETIME, clock_out DATETIME,
       clock_in_status ENUM('pending','approved','rejected') DEFAULT 'pending',
       clock_out_status ENUM('pending','approved','rejected','na') DEFAULT 'na',
+      clock_in_flag ENUM('on_time','late','early') DEFAULT 'on_time',
+      clock_out_flag ENUM('on_time','late','early') DEFAULT 'on_time',
       approved_clock_in DATETIME, approved_clock_out DATETIME,
       approved_by INT, approved_at TIMESTAMP NULL,
       note TEXT, admin_note TEXT,
@@ -147,50 +212,27 @@ async function setupDatabase(){
       type ENUM('sunday','public','manual') DEFAULT 'manual',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
 
-    /* ── Migrations for existing installs ── */
+    /* ── Migrations ── */
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
+    await c.query(`ALTER TABLE users ADD COLUMN employee_category ENUM('office','field') DEFAULT 'office'`).catch(()=>{});
+    await c.query(`ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT ''`).catch(()=>{});
     await c.query(`ALTER TABLE notifications MODIFY COLUMN type VARCHAR(50) DEFAULT 'assigned'`).catch(()=>{});
-
-    /* Safely rename changed_by_id → user_id (old schema) */
     await c.query(`ALTER TABLE task_history CHANGE COLUMN changed_by_id user_id INT NOT NULL`).catch(()=>{});
-
-    /* Add user_id if completely missing */
     await c.query(`ALTER TABLE task_history ADD COLUMN user_id INT NOT NULL DEFAULT 1`).catch(()=>{});
-
-    /* Add comment column — use a workaround for MySQL versions without IF NOT EXISTS */
-    const[commentCol]=await c.query(
-      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_history' AND COLUMN_NAME='comment'"
-    );
-    if(!commentCol.length){
-      await c.query(`ALTER TABLE task_history ADD COLUMN comment TEXT`);
-      console.log('✅ Added comment column to task_history');
-    }
-
-    /* Add field column if missing */
-    const[fieldCol]=await c.query(
-      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_history' AND COLUMN_NAME='field'"
-    );
-    if(!fieldCol.length){
-      await c.query(`ALTER TABLE task_history ADD COLUMN field VARCHAR(50)`);
-      console.log('✅ Added field column to task_history');
-    }
-
-    /* Add old_value/new_value columns if missing */
-    const[ovCol]=await c.query(
-      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_history' AND COLUMN_NAME='old_value'"
-    );
-    if(!ovCol.length){
-      await c.query(`ALTER TABLE task_history ADD COLUMN old_value TEXT`);
-      await c.query(`ALTER TABLE task_history ADD COLUMN new_value TEXT`);
-      console.log('✅ Added old_value/new_value columns to task_history');
-    }
-
     await c.query(`ALTER TABLE task_history MODIFY COLUMN action VARCHAR(100) NOT NULL`).catch(()=>{});
+    // attendance flag columns
+    await c.query(`ALTER TABLE attendance ADD COLUMN clock_in_flag ENUM('on_time','late','early') DEFAULT 'on_time'`).catch(()=>{});
+    await c.query(`ALTER TABLE attendance ADD COLUMN clock_out_flag ENUM('on_time','late','early') DEFAULT 'on_time'`).catch(()=>{});
+
+    const cols = ['comment','field','old_value','new_value'];
+    for(const col of cols){
+      const[rows]=await c.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_history' AND COLUMN_NAME=?`,[col]);
+      if(!rows.length) await c.query(`ALTER TABLE task_history ADD COLUMN ${col} ${col==='field'?'VARCHAR(50)':'TEXT'}`);
+    }
 
     /* Seed */
     const hash = await bcrypt.hash('Admin@1234',10);
-    await c.query(`INSERT IGNORE INTO users(username,email,password_hash,full_name,role,avatar_color)
-      VALUES('admin','admin@company.com',?,'System Admin','admin','#7C5CFC')`,[hash]);
+    await c.query(`INSERT IGNORE INTO users(username,email,password_hash,full_name,role,avatar_color) VALUES('admin','admin@company.com',?,'System Admin','admin','#7C5CFC')`,[hash]);
     for(const[n,cl] of [['bug','#F87171'],['feature','#5B8AF0'],['design','#8B5CF6'],['backend','#FBBF24'],['frontend','#34D399'],['urgent','#F87171']])
       await c.query('INSERT IGNORE INTO tags(name,color) VALUES(?,?)',[n,cl]);
 
@@ -216,7 +258,6 @@ const auth = async(req,res,next)=>{
     next();
   }catch{ res.status(401).json({error:'Invalid token'}); }
 };
-
 const adminOnly=(req,res,next)=>req.user?.role==='admin'?next():res.status(403).json({error:'Admin only'});
 const adminOrSupervisor=(req,res,next)=>(req.user?.role==='admin'||req.user?.role==='supervisor')?next():res.status(403).json({error:'Insufficient permissions'});
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(e=>{console.error(e.message);res.status(500).json({error:e.message||'Server error'});});
@@ -224,24 +265,17 @@ const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(e=>{conso
 const localDate=(d=new Date())=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),dd=String(d.getDate()).padStart(2,'0');return`${y}-${m}-${dd}`;};
 const toMySQL=(val)=>{if(!val)return null;if(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(val))return val;const d=new Date(val);if(isNaN(d.getTime()))return null;const p=n=>String(n).padStart(2,'0');return`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;};
 
-/* Check if user has active access to a task (not revoked) */
+/* Task access helper */
 async function hasTaskAccess(taskId, userId, role){
   if(role==='admin') return 'full';
-  // Check revoked first
   const[rev]=await pool.query('SELECT 1 FROM task_revoked WHERE task_id=? AND user_id=?',[taskId,userId]);
   if(rev.length) return 'none';
-  // Check if supervisor with view_all_tasks
   if(role==='supervisor') return 'supervisor';
-  // Check assignee or creator
-  const[rows]=await pool.query(
-    'SELECT 1 FROM tasks WHERE id=? AND (creator_id=? OR id IN (SELECT task_id FROM task_assignees WHERE user_id=?))',
-    [taskId,userId,userId]);
+  const[rows]=await pool.query('SELECT 1 FROM tasks WHERE id=? AND (creator_id=? OR id IN (SELECT task_id FROM task_assignees WHERE user_id=?))',[taskId,userId,userId]);
   return rows.length ? 'member' : 'none';
 }
-
 async function logHistory(taskId, userId, action, field, oldVal, newVal, comment){
-  await pool.query('INSERT INTO task_history(task_id,user_id,action,field,old_value,new_value,comment) VALUES(?,?,?,?,?,?,?)',
-    [taskId,userId,action,field||null,oldVal||null,newVal||null,comment||null]);
+  await pool.query('INSERT INTO task_history(task_id,user_id,action,field,old_value,new_value,comment) VALUES(?,?,?,?,?,?,?)',[taskId,userId,action,field||null,oldVal||null,newVal||null,comment||null]);
 }
 
 /* ══════════════════════════════════════
@@ -256,12 +290,9 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
   if(!await bcrypt.compare(password,u.password_hash)) return res.status(401).json({error:'Invalid credentials'});
   const token=jwt.sign({id:u.id,username:u.username,role:u.role},JWT_SECRET,{expiresIn:'8h'});
   let permissions={};
-  if(u.role==='supervisor'){
-    const[perms]=await pool.query('SELECT * FROM supervisor_permissions WHERE user_id=?',[u.id]);
-    permissions=perms[0]||{};
-  }
+  if(u.role==='supervisor'){const[perms]=await pool.query('SELECT * FROM supervisor_permissions WHERE user_id=?',[u.id]);permissions=perms[0]||{};}
   pool.query('INSERT INTO activity_log(user_id,action,entity_type) VALUES(?,?,?)',[u.id,'login','user']).catch(()=>{});
-  res.json({token,user:{id:u.id,username:u.username,email:u.email,full_name:u.full_name,role:u.role,avatar_color:u.avatar_color,permissions}});
+  res.json({token,user:{id:u.id,username:u.username,email:u.email,full_name:u.full_name,role:u.role,employee_category:u.employee_category||'office',department:u.department||'',avatar_color:u.avatar_color,permissions}});
 }));
 
 /* ══════════════════════════════════════
@@ -269,7 +300,8 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
 ══════════════════════════════════════ */
 app.get('/api/users', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(`
-    SELECT u.id,u.username,u.email,u.full_name,u.role,u.avatar_color,u.is_active,u.created_at,
+    SELECT u.id,u.username,u.email,u.full_name,u.role,u.employee_category,u.department,
+      u.avatar_color,u.is_active,u.created_at,
       sp.can_approve_attendance,sp.can_view_all_attendance,sp.can_edit_tasks,
       sp.can_create_tasks,sp.can_view_all_tasks,sp.can_manage_holidays
     FROM users u LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id ORDER BY u.full_name`);
@@ -277,19 +309,19 @@ app.get('/api/users', auth, wrap(async(req,res)=>{
 }));
 
 app.post('/api/users', auth, adminOnly, wrap(async(req,res)=>{
-  const{username,email,password,full_name,role}=req.body;
+  const{username,email,password,full_name,role,employee_category,department}=req.body;
   if(!username||!email||!password) return res.status(400).json({error:'Missing fields'});
   const hash=await bcrypt.hash(password,10);
   const colors=['#3B82F6','#10B981','#F59E0B','#8B5CF6','#EC4899','#06B6D4'];
   const color=colors[Math.floor(Math.random()*colors.length)];
-  const[r]=await pool.query('INSERT INTO users(username,email,password_hash,full_name,role,avatar_color) VALUES(?,?,?,?,?,?)',
-    [username,email,hash,full_name||username,role||'member',color]);
+  const[r]=await pool.query('INSERT INTO users(username,email,password_hash,full_name,role,employee_category,department,avatar_color) VALUES(?,?,?,?,?,?,?,?)',
+    [username,email,hash,full_name||username,role||'member',employee_category||'office',department||'',color]);
   if(role==='supervisor') await pool.query('INSERT IGNORE INTO supervisor_permissions(user_id) VALUES(?)',[r.insertId]);
-  res.json({id:r.insertId,username,email,full_name,role:role||'member',avatar_color:color});
+  res.json({id:r.insertId,username,email,full_name,role:role||'member',employee_category:employee_category||'office',department:department||'',avatar_color:color});
 }));
 
 app.put('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
-  const{email,full_name,role,is_active,password,permissions}=req.body;
+  const{email,full_name,role,is_active,password,permissions,employee_category,department}=req.body;
   const uid=parseInt(req.params.id);
   const u=[],v=[];
   if(email!==undefined){u.push('email=?');v.push(email);}
@@ -297,6 +329,8 @@ app.put('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
   if(role!==undefined){u.push('role=?');v.push(role);}
   if(is_active!==undefined){u.push('is_active=?');v.push(is_active?1:0);}
   if(password){u.push('password_hash=?');v.push(await bcrypt.hash(password,10));}
+  if(employee_category!==undefined){u.push('employee_category=?');v.push(employee_category);}
+  if(department!==undefined){u.push('department=?');v.push(department);}
   if(u.length){v.push(uid);await pool.query(`UPDATE users SET ${u.join(',')} WHERE id=?`,v);}
   if(role==='supervisor'||permissions){
     const[ex]=await pool.query('SELECT user_id FROM supervisor_permissions WHERE user_id=?',[uid]);
@@ -327,207 +361,116 @@ const parseTask=r=>({...r,
   assignees:r.assignees_raw?r.assignees_raw.split('||').map(a=>{const[id,fn,un,ac]=a.split('::');return{id:parseInt(id),full_name:fn,username:un,avatar_color:ac};}).filter(a=>!isNaN(a.id)):[]
 });
 
-/* Task visibility:
-   - Admin / supervisor(all): see everything
-   - Others: creator OR assignee AND not revoked */
 app.get('/api/tasks', auth, wrap(async(req,res)=>{
   const{status,tag}=req.query;
   const isAdmin=req.user.role==='admin';
   const supAll=req.user.role==='supervisor'&&req.user.permissions?.can_view_all_tasks;
   const showAll=isAdmin||supAll;
   const userId=req.user.id;
-  let vis=showAll?'1=1':
-    `(t.creator_id=? OR t.id IN(SELECT task_id FROM task_assignees WHERE user_id=?))
-     AND t.id NOT IN(SELECT task_id FROM task_revoked WHERE user_id=?)`;
+  let vis=showAll?'1=1':`(t.creator_id=? OR t.id IN(SELECT task_id FROM task_assignees WHERE user_id=?)) AND t.id NOT IN(SELECT task_id FROM task_revoked WHERE user_id=?)`;
   const params=showAll?[]:[userId,userId,userId];
   let extra='';
   if(status){extra+=' AND t.status=?';params.push(status);}
   if(tag){extra+=` AND t.id IN(SELECT tt2.task_id FROM task_tags tt2 JOIN tags tg2 ON tt2.tag_id=tg2.id WHERE tg2.name=?)`;params.push(tag);}
-  const sql=`SELECT DISTINCT t.*,
-    u1.username as creator_username,u1.full_name as creator_name,u1.avatar_color as creator_color,
+  const sql=`SELECT DISTINCT t.*,u1.username as creator_username,u1.full_name as creator_name,u1.avatar_color as creator_color,
     GROUP_CONCAT(DISTINCT CONCAT(tg.name,'::',tg.color) ORDER BY tg.name SEPARATOR '||') as tags_raw,
-    GROUP_CONCAT(DISTINCT CONCAT(u2.id,'::',IFNULL(u2.full_name,''),'::',u2.username,'::',IFNULL(u2.avatar_color,'#3B82F6'))
-      ORDER BY u2.full_name SEPARATOR '||') as assignees_raw
-  FROM tasks t
-  LEFT JOIN users u1 ON t.creator_id=u1.id
-  LEFT JOIN task_assignees ta ON t.id=ta.task_id
-  LEFT JOIN users u2 ON ta.user_id=u2.id
-  LEFT JOIN task_tags tt ON t.id=tt.task_id
-  LEFT JOIN tags tg ON tt.tag_id=tg.id
-  WHERE (${vis}) ${extra}
-  GROUP BY t.id ORDER BY t.created_at DESC`;
+    GROUP_CONCAT(DISTINCT CONCAT(u2.id,'::',IFNULL(u2.full_name,''),'::',u2.username,'::',IFNULL(u2.avatar_color,'#3B82F6')) ORDER BY u2.full_name SEPARATOR '||') as assignees_raw
+  FROM tasks t LEFT JOIN users u1 ON t.creator_id=u1.id LEFT JOIN task_assignees ta ON t.id=ta.task_id
+  LEFT JOIN users u2 ON ta.user_id=u2.id LEFT JOIN task_tags tt ON t.id=tt.task_id LEFT JOIN tags tg ON tt.tag_id=tg.id
+  WHERE (${vis}) ${extra} GROUP BY t.id ORDER BY t.created_at DESC`;
   const[rows]=await pool.query(sql,params);
   res.json(rows.map(parseTask));
 }));
 
-/* Single task with access check */
 app.get('/api/tasks/:id', auth, wrap(async(req,res)=>{
   const access=await hasTaskAccess(req.params.id,req.user.id,req.user.role);
   if(access==='none') return res.status(403).json({error:'Access denied'});
-  const[rows]=await pool.query(`SELECT DISTINCT t.*,
-    u1.username as creator_username,u1.full_name as creator_name,u1.avatar_color as creator_color,
+  const[rows]=await pool.query(`SELECT DISTINCT t.*,u1.username as creator_username,u1.full_name as creator_name,u1.avatar_color as creator_color,
     GROUP_CONCAT(DISTINCT CONCAT(tg.name,'::',tg.color) ORDER BY tg.name SEPARATOR '||') as tags_raw,
-    GROUP_CONCAT(DISTINCT CONCAT(u2.id,'::',IFNULL(u2.full_name,''),'::',u2.username,'::',IFNULL(u2.avatar_color,'#3B82F6'))
-      ORDER BY u2.full_name SEPARATOR '||') as assignees_raw
-  FROM tasks t LEFT JOIN users u1 ON t.creator_id=u1.id
-  LEFT JOIN task_assignees ta ON t.id=ta.task_id
-  LEFT JOIN users u2 ON ta.user_id=u2.id
-  LEFT JOIN task_tags tt ON t.id=tt.task_id
-  LEFT JOIN tags tg ON tt.tag_id=tg.id
+    GROUP_CONCAT(DISTINCT CONCAT(u2.id,'::',IFNULL(u2.full_name,''),'::',u2.username,'::',IFNULL(u2.avatar_color,'#3B82F6')) ORDER BY u2.full_name SEPARATOR '||') as assignees_raw
+  FROM tasks t LEFT JOIN users u1 ON t.creator_id=u1.id LEFT JOIN task_assignees ta ON t.id=ta.task_id
+  LEFT JOIN users u2 ON ta.user_id=u2.id LEFT JOIN task_tags tt ON t.id=tt.task_id LEFT JOIN tags tg ON tt.tag_id=tg.id
   WHERE t.id=? GROUP BY t.id`,[req.params.id]);
   if(!rows.length) return res.status(404).json({error:'Not found'});
   const task=parseTask(rows[0]);
-  // For admin: also return list of users whose access was revoked
   if(req.user.role==='admin'){
-    const[revoked]=await pool.query(
-      'SELECT u.id,u.full_name,u.avatar_color FROM task_revoked tr JOIN users u ON tr.user_id=u.id WHERE tr.task_id=?',
-      [req.params.id]);
+    const[revoked]=await pool.query('SELECT u.id,u.full_name,u.avatar_color FROM task_revoked tr JOIN users u ON tr.user_id=u.id WHERE tr.task_id=?',[req.params.id]);
     task.revoked_users=revoked;
   }
   res.json({...task,access});
 }));
 
-/* Create task */
 app.post('/api/tasks', auth, wrap(async(req,res)=>{
-  const isAdmin=req.user.role==='admin';
-  const isSupervisor=req.user.role==='supervisor';
-  const isMember=req.user.role==='member';
+  const isAdmin=req.user.role==='admin',isSupervisor=req.user.role==='supervisor',isMember=req.user.role==='member';
   const canCreate=isAdmin||(isSupervisor&&req.user.permissions?.can_create_tasks)||isMember;
   if(!canCreate) return res.status(403).json({error:'Permission denied'});
-
   const{title,description,status,priority,assignee_ids,due_date,tags}=req.body;
   if(!title?.trim()) return res.status(400).json({error:'Title required'});
-
-  const[r]=await pool.query('INSERT INTO tasks(title,description,status,priority,creator_id,due_date) VALUES(?,?,?,?,?,?)',
-    [title.trim(),description||'',status||'todo',priority||'medium',req.user.id,due_date||null]);
+  const[r]=await pool.query('INSERT INTO tasks(title,description,status,priority,creator_id,due_date) VALUES(?,?,?,?,?,?)',[title.trim(),description||'',status||'todo',priority||'medium',req.user.id,due_date||null]);
   const taskId=r.insertId;
-
-  // Members can ONLY assign to themselves
   const rawList=Array.isArray(assignee_ids)?assignee_ids.map(Number):[];
   const aList=isMember?[req.user.id]:(rawList.length?rawList:[req.user.id]);
-
   for(const uid of aList){try{await pool.query('INSERT IGNORE INTO task_assignees(task_id,user_id) VALUES(?,?)',[taskId,uid]);}catch{}}
-
-  // Tags
-  if(Array.isArray(tags)&&tags.length){
-    for(const tn of tags){try{let[tr]=await pool.query('SELECT id FROM tags WHERE name=?',[tn]);const tid=tr.length?tr[0].id:(await pool.query('INSERT INTO tags(name) VALUES(?)',[tn]))[0].insertId;await pool.query('INSERT IGNORE INTO task_tags VALUES(?,?)',[taskId,tid]);}catch{}}
-  }
-
-  // Log creation
+  if(Array.isArray(tags)&&tags.length){for(const tn of tags){try{let[tr]=await pool.query('SELECT id FROM tags WHERE name=?',[tn]);const tid=tr.length?tr[0].id:(await pool.query('INSERT INTO tags(name) VALUES(?)',[tn]))[0].insertId;await pool.query('INSERT IGNORE INTO task_tags VALUES(?,?)',[taskId,tid]);}catch{}}}
   await logHistory(taskId,req.user.id,'created',null,null,title.trim(),null);
-
-  // Log initial assignment
   const[aNames]=await pool.query('SELECT full_name FROM users WHERE id IN('+aList.map(()=>'?').join(',')+')',aList);
   await logHistory(taskId,req.user.id,'assigned','assignees',null,aNames.map(u=>u.full_name).join(', '),null);
-
-  // Notify new assignees (not self)
-  for(const uid of aList){
-    if(uid!==req.user.id){
-      try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,req.user.id,'assigned']);sendEmail(uid,req.user.username,title,'assigned').catch(()=>{});}catch{}
-    }
-  }
+  for(const uid of aList){if(uid!==req.user.id){try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,req.user.id,'assigned']);sendEmail(uid,req.user.username,title,'assigned').catch(()=>{});}catch{}}}
   res.json({id:taskId});
 }));
 
-/* Full edit — admin only (or supervisor with perm).
-   Regular members use the dedicated /status and /move-to endpoints */
 app.put('/api/tasks/:id', auth, wrap(async(req,res)=>{
   const isAdmin=req.user.role==='admin';
   const canEdit=isAdmin||(req.user.role==='supervisor'&&req.user.permissions?.can_edit_tasks);
   if(!canEdit) return res.status(403).json({error:'Only admins and authorised supervisors can fully edit tasks'});
-
   const{title,description,status,priority,assignee_ids,due_date}=req.body;
   const taskId=req.params.id;
   const[old]=await pool.query('SELECT * FROM tasks WHERE id=?',[taskId]);
   if(!old.length) return res.status(404).json({error:'Task not found'});
   const prev=old[0];
-
-  await pool.query('UPDATE tasks SET title=?,description=?,status=?,priority=?,due_date=? WHERE id=?',
-    [title||prev.title,description??prev.description,status||prev.status,priority||prev.priority,due_date||null,taskId]);
-
-  if(prev.status!==(status||prev.status))
-    await logHistory(taskId,req.user.id,'status_changed','status',prev.status,status,null);
-  if(prev.priority!==(priority||prev.priority))
-    await logHistory(taskId,req.user.id,'priority_changed','priority',prev.priority,priority,null);
-  if((title||prev.title)!==prev.title)
-    await logHistory(taskId,req.user.id,'edited','title',prev.title,title,null);
-
+  await pool.query('UPDATE tasks SET title=?,description=?,status=?,priority=?,due_date=? WHERE id=?',[title||prev.title,description??prev.description,status||prev.status,priority||prev.priority,due_date||null,taskId]);
+  if(prev.status!==(status||prev.status)) await logHistory(taskId,req.user.id,'status_changed','status',prev.status,status,null);
+  if(prev.priority!==(priority||prev.priority)) await logHistory(taskId,req.user.id,'priority_changed','priority',prev.priority,priority,null);
+  if((title||prev.title)!==prev.title) await logHistory(taskId,req.user.id,'edited','title',prev.title,title,null);
   if(Array.isArray(assignee_ids)){
     const newList=assignee_ids.map(Number);
     const[oldRows]=await pool.query('SELECT ta.user_id,u.full_name FROM task_assignees ta JOIN users u ON ta.user_id=u.id WHERE ta.task_id=?',[taskId]);
     const oldList=oldRows.map(r=>r.user_id);
-    const newlyAdded=newList.filter(id=>!oldList.includes(id));
-    const removed=oldList.filter(id=>!newList.includes(id));
+    const newlyAdded=newList.filter(id=>!oldList.includes(id)),removed=oldList.filter(id=>!newList.includes(id));
     await pool.query('DELETE FROM task_assignees WHERE task_id=?',[taskId]);
     for(const uid of newList){try{await pool.query('INSERT IGNORE INTO task_assignees(task_id,user_id) VALUES(?,?)',[taskId,uid]);}catch{}}
-    // Admin editing can also restore revoked access
     if(newList.length) await pool.query('DELETE FROM task_revoked WHERE task_id=? AND user_id IN('+newList.map(()=>'?').join(',')+')',[taskId,...newList]).catch(()=>{});
-    if(newlyAdded.length){
-      const[addNames]=await pool.query('SELECT full_name FROM users WHERE id IN('+newlyAdded.map(()=>'?').join(',')+')',newlyAdded);
-      await logHistory(taskId,req.user.id,'assigned','assignees',null,addNames.map(u=>u.full_name).join(', '),null);
-    }
-    if(removed.length){
-      const removedNames=oldRows.filter(r=>removed.includes(r.user_id)).map(r=>r.full_name);
-      await logHistory(taskId,req.user.id,'unassigned','assignees',removedNames.join(', '),null,null);
-    }
-    for(const uid of newlyAdded){
-      if(uid!==req.user.id){try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,req.user.id,'assigned']);sendEmail(uid,req.user.username,title,'assigned').catch(()=>{});}catch{}}
-    }
+    if(newlyAdded.length){const[addNames]=await pool.query('SELECT full_name FROM users WHERE id IN('+newlyAdded.map(()=>'?').join(',')+')',newlyAdded);await logHistory(taskId,req.user.id,'assigned','assignees',null,addNames.map(u=>u.full_name).join(', '),null);}
+    if(removed.length){const removedNames=oldRows.filter(r=>removed.includes(r.user_id)).map(r=>r.full_name);await logHistory(taskId,req.user.id,'unassigned','assignees',removedNames.join(', '),null,null);}
+    for(const uid of newlyAdded){if(uid!==req.user.id){try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,req.user.id,'assigned']);sendEmail(uid,req.user.username,title,'assigned').catch(()=>{});}catch{}}}
   }
   res.json({success:true});
 }));
 
 app.delete('/api/tasks/:id', auth, adminOnly, wrap(async(req,res)=>{
-  await pool.query('DELETE FROM tasks WHERE id=?',[req.params.id]);
-  res.json({success:true});
+  await pool.query('DELETE FROM tasks WHERE id=?',[req.params.id]);res.json({success:true});
 }));
 
-/* ══════════════════════════════════════
-   TASK STATUS CHANGE — any active assignee
-   Requires a comment. Immutable once saved.
-══════════════════════════════════════ */
 app.post('/api/tasks/:id/status', auth, wrap(async(req,res)=>{
-  const taskId=req.params.id;
-  const userId=req.user.id;
-  const{new_status,comment}=req.body;
-
+  const taskId=req.params.id,userId=req.user.id,{new_status,comment}=req.body;
   if(!new_status) return res.status(400).json({error:'new_status required'});
   if(!comment?.trim()) return res.status(400).json({error:'A comment is required when changing status'});
-
   const access=await hasTaskAccess(taskId,userId,req.user.role);
   if(access==='none') return res.status(403).json({error:'You do not have access to this task'});
-
-  // Non-admins must be an active assignee
-  if(req.user.role!=='admin'){
-    const[assigned]=await pool.query('SELECT 1 FROM task_assignees WHERE task_id=? AND user_id=?',[taskId,userId]);
-    if(!assigned.length) return res.status(403).json({error:'Only current assignees can change task status'});
-  }
-
+  if(req.user.role!=='admin'){const[assigned]=await pool.query('SELECT 1 FROM task_assignees WHERE task_id=? AND user_id=?',[taskId,userId]);if(!assigned.length) return res.status(403).json({error:'Only current assignees can change task status'});}
   const[taskRows]=await pool.query('SELECT * FROM tasks WHERE id=?',[taskId]);
   if(!taskRows.length) return res.status(404).json({error:'Task not found'});
   const prev=taskRows[0];
-
   if(prev.status===new_status) return res.status(400).json({error:'Task already has this status'});
-
   await pool.query('UPDATE tasks SET status=? WHERE id=?',[new_status,taskId]);
   await logHistory(taskId,userId,'status_changed','status',prev.status,new_status,comment.trim());
-
-  // Notify all other assignees
   const[assignees]=await pool.query('SELECT user_id FROM task_assignees WHERE task_id=? AND user_id!=?',[taskId,userId]);
-  for(const a of assignees){
-    try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[a.user_id,taskId,userId,'status_changed']);}catch{}
-  }
+  for(const a of assignees){try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[a.user_id,taskId,userId,'status_changed']);}catch{}}
   res.json({success:true});
 }));
 
-/* ══════════════════════════════════════
-   TASK COMMENT — any active member
-   Comments are immutable (no edit/delete except admin)
-══════════════════════════════════════ */
 app.post('/api/tasks/:id/comment', auth, wrap(async(req,res)=>{
-  const taskId=req.params.id;
-  const userId=req.user.id;
-  const{comment}=req.body;
+  const taskId=req.params.id,userId=req.user.id,{comment}=req.body;
   if(!comment?.trim()) return res.status(400).json({error:'Comment cannot be empty'});
   const access=await hasTaskAccess(taskId,userId,req.user.role);
   if(access==='none') return res.status(403).json({error:'Access denied'});
@@ -535,142 +478,72 @@ app.post('/api/tasks/:id/comment', auth, wrap(async(req,res)=>{
   res.json({success:true});
 }));
 
-/* Admin can delete a history entry (comment/note) */
 app.delete('/api/tasks/:tid/history/:hid', auth, adminOnly, wrap(async(req,res)=>{
   await pool.query('DELETE FROM task_history WHERE id=? AND task_id=?',[req.params.hid,req.params.tid]);
   res.json({success:true});
 }));
 
-/* ══════════════════════════════════════
-   MOVE TO — transfer task to new person(s)
-   Moving user loses ALL access (revoked).
-   Admin can move without losing access.
-══════════════════════════════════════ */
 app.post('/api/tasks/:id/move-to', auth, wrap(async(req,res)=>{
-  const taskId=req.params.id;
-  const userId=req.user.id;
-  const isAdmin=req.user.role==='admin';
+  const taskId=req.params.id,userId=req.user.id,isAdmin=req.user.role==='admin';
   const{new_assignee_ids,comment}=req.body;
-
-  if(!Array.isArray(new_assignee_ids)||!new_assignee_ids.length)
-    return res.status(400).json({error:'At least one new assignee required'});
-
+  if(!Array.isArray(new_assignee_ids)||!new_assignee_ids.length) return res.status(400).json({error:'At least one new assignee required'});
   const access=await hasTaskAccess(taskId,userId,req.user.role);
   if(access==='none') return res.status(403).json({error:'You have no access to this task'});
-
-  // Non-admins must currently be an assignee to move
-  if(!isAdmin){
-    const[assigned]=await pool.query('SELECT 1 FROM task_assignees WHERE task_id=? AND user_id=?',[taskId,userId]);
-    if(!assigned.length) return res.status(403).json({error:'Only current assignees can move this task'});
-  }
-
+  if(!isAdmin){const[assigned]=await pool.query('SELECT 1 FROM task_assignees WHERE task_id=? AND user_id=?',[taskId,userId]);if(!assigned.length) return res.status(403).json({error:'Only current assignees can move this task'});}
   const[taskRows]=await pool.query('SELECT * FROM tasks WHERE id=?',[taskId]);
   if(!taskRows.length) return res.status(404).json({error:'Task not found'});
   const task=taskRows[0];
-
-  // Get current assignees for log
   const[oldRows]=await pool.query('SELECT ta.user_id,u.full_name FROM task_assignees ta JOIN users u ON ta.user_id=u.id WHERE ta.task_id=?',[taskId]);
   const oldNames=oldRows.map(r=>r.full_name).join(', ')||'—';
-
   const newList=new_assignee_ids.map(Number);
-
-  // Replace all assignees
   await pool.query('DELETE FROM task_assignees WHERE task_id=?',[taskId]);
   for(const uid of newList){try{await pool.query('INSERT IGNORE INTO task_assignees(task_id,user_id) VALUES(?,?)',[taskId,uid]);}catch{}}
-
-  // Revoke access from the moving user (unless admin or they're also in the new list)
-  if(!isAdmin&&!newList.includes(userId)){
-    await pool.query('INSERT IGNORE INTO task_revoked(task_id,user_id) VALUES(?,?)',[taskId,userId]);
-  }
-
+  if(!isAdmin&&!newList.includes(userId)) await pool.query('INSERT IGNORE INTO task_revoked(task_id,user_id) VALUES(?,?)',[taskId,userId]);
   const[newNames]=await pool.query('SELECT full_name FROM users WHERE id IN('+newList.map(()=>'?').join(',')+')',newList);
-  const newNamesStr=newNames.map(u=>u.full_name).join(', ');
-
-  await logHistory(taskId,userId,'moved','assignees',oldNames,newNamesStr,comment||null);
-
-  // Notify new assignees
-  for(const uid of newList){
-    if(uid!==userId){
-      try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,userId,'reassigned']);sendEmail(uid,req.user.username,task.title,'reassigned').catch(()=>{});}catch{}
-    }
-  }
+  await logHistory(taskId,userId,'moved','assignees',oldNames,newNames.map(u=>u.full_name).join(', '),comment||null);
+  for(const uid of newList){if(uid!==userId){try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,userId,'reassigned']);sendEmail(uid,req.user.username,task.title,'reassigned').catch(()=>{});}catch{}}}
   res.json({success:true});
 }));
 
-/* Mark complete & optionally reassign */
 app.post('/api/tasks/:id/complete', auth, wrap(async(req,res)=>{
-  const taskId=req.params.id;
-  const userId=req.user.id;
-  const isAdmin=req.user.role==='admin';
+  const taskId=req.params.id,userId=req.user.id,isAdmin=req.user.role==='admin';
   const{new_assignee_ids,comment}=req.body;
-
-  if(!isAdmin){
-    const[assigned]=await pool.query('SELECT 1 FROM task_assignees WHERE task_id=? AND user_id=?',[taskId,userId]);
-    if(!assigned.length) return res.status(403).json({error:'Not assigned to this task'});
-  }
+  if(!isAdmin){const[assigned]=await pool.query('SELECT 1 FROM task_assignees WHERE task_id=? AND user_id=?',[taskId,userId]);if(!assigned.length) return res.status(403).json({error:'Not assigned to this task'});}
   const[taskRows]=await pool.query('SELECT * FROM tasks WHERE id=?',[taskId]);
   if(!taskRows.length) return res.status(404).json({error:'Not found'});
   const task=taskRows[0];
-
   await pool.query('UPDATE tasks SET status=? WHERE id=?',['done',taskId]);
   await logHistory(taskId,userId,'status_changed','status',task.status,'done',comment||null);
-
   const newList=Array.isArray(new_assignee_ids)?new_assignee_ids.map(Number):[];
   if(newList.length){
-    // Remove current user, add new assignees
     await pool.query('DELETE FROM task_assignees WHERE task_id=? AND user_id=?',[taskId,userId]);
     for(const uid of newList){try{await pool.query('INSERT IGNORE INTO task_assignees(task_id,user_id) VALUES(?,?)',[taskId,uid]);}catch{}}
-    if(!isAdmin&&!newList.includes(userId))
-      await pool.query('INSERT IGNORE INTO task_revoked(task_id,user_id) VALUES(?,?)',[taskId,userId]);
+    if(!isAdmin&&!newList.includes(userId)) await pool.query('INSERT IGNORE INTO task_revoked(task_id,user_id) VALUES(?,?)',[taskId,userId]);
     const[nn]=await pool.query('SELECT full_name FROM users WHERE id IN('+newList.map(()=>'?').join(',')+')',newList);
     await logHistory(taskId,userId,'moved','assignees','(completed)',nn.map(u=>u.full_name).join(', '),null);
-    for(const uid of newList){
-      if(uid!==userId){try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,userId,'reassigned']);sendEmail(uid,req.user.username,task.title,'reassigned').catch(()=>{});}catch{}}
-    }
+    for(const uid of newList){if(uid!==userId){try{await pool.query('INSERT INTO notifications(user_id,task_id,triggered_by_id,type) VALUES(?,?,?,?)',[uid,taskId,userId,'reassigned']);sendEmail(uid,req.user.username,task.title,'reassigned').catch(()=>{});}catch{}}}
   }
   res.json({success:true});
 }));
 
-/* ══════════════════════════════════════
-   TASK HISTORY / TIMELINE
-   Visible to all current task members + admin
-══════════════════════════════════════ */
 app.get('/api/tasks/:id/history', auth, wrap(async(req,res)=>{
   const taskId=req.params.id;
   const access=await hasTaskAccess(taskId,req.user.id,req.user.role);
-  // Even revoked users can see the history (read-only), admin always sees
-  const[rows]=await pool.query(`
-    SELECT th.*,
-      u.full_name as actor_name, u.username as actor_username,
-      u.avatar_color as actor_color, u.role as actor_role
-    FROM task_history th JOIN users u ON th.user_id=u.id
-    WHERE th.task_id=? ORDER BY th.created_at ASC`,[taskId]);
+  if(access==='none'&&req.user.role!=='admin') return res.status(403).json({error:'Access denied'});
+  const[rows]=await pool.query(`SELECT th.*,u.full_name as actor_name,u.username as actor_username,u.avatar_color as actor_color,u.role as actor_role FROM task_history th JOIN users u ON th.user_id=u.id WHERE th.task_id=? ORDER BY th.created_at ASC`,[taskId]);
   res.json(rows);
 }));
 
 /* ══════════════════════════════════════
-   TAGS
+   TAGS & NOTIFICATIONS
 ══════════════════════════════════════ */
-app.get('/api/tags', auth, wrap(async(req,res)=>{
-  const[rows]=await pool.query('SELECT * FROM tags ORDER BY name'); res.json(rows);
-}));
-
-/* ══════════════════════════════════════
-   NOTIFICATIONS
-══════════════════════════════════════ */
+app.get('/api/tags', auth, wrap(async(req,res)=>{const[rows]=await pool.query('SELECT * FROM tags ORDER BY name');res.json(rows);}));
 app.get('/api/notifications', auth, wrap(async(req,res)=>{
-  const[rows]=await pool.query(`
-    SELECT n.*,t.title as task_title,u.username as triggered_by,u.full_name as triggered_by_name
-    FROM notifications n JOIN tasks t ON n.task_id=t.id JOIN users u ON n.triggered_by_id=u.id
-    WHERE n.user_id=? ORDER BY n.created_at DESC LIMIT 30`,[req.user.id]);
+  const[rows]=await pool.query(`SELECT n.*,t.title as task_title,u.username as triggered_by,u.full_name as triggered_by_name FROM notifications n JOIN tasks t ON n.task_id=t.id JOIN users u ON n.triggered_by_id=u.id WHERE n.user_id=? ORDER BY n.created_at DESC LIMIT 30`,[req.user.id]);
   res.json(rows);
 }));
-app.put('/api/notifications/:id/read', auth, wrap(async(req,res)=>{
-  await pool.query('UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?',[req.params.id,req.user.id]); res.json({success:true});
-}));
-app.put('/api/notifications/read-all', auth, wrap(async(req,res)=>{
-  await pool.query('UPDATE notifications SET is_read=1 WHERE user_id=?',[req.user.id]); res.json({success:true});
-}));
+app.put('/api/notifications/:id/read', auth, wrap(async(req,res)=>{await pool.query('UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?',[req.params.id,req.user.id]);res.json({success:true});}));
+app.put('/api/notifications/read-all', auth, wrap(async(req,res)=>{await pool.query('UPDATE notifications SET is_read=1 WHERE user_id=?',[req.user.id]);res.json({success:true});}));
 
 /* ══════════════════════════════════════
    ATTENDANCE
@@ -683,33 +556,81 @@ async function ensureSundaysHolidays(startDate,endDate){
 }
 
 app.post('/api/attendance/clock-in', auth, wrap(async(req,res)=>{
-  if(req.user.role==='admin') return res.status(403).json({error:'Administrators manage attendance through the panel, not clock in.'});
+  if(req.user.role==='admin') return res.status(403).json({error:'Administrators manage attendance through the panel.'});
   const userId=req.user.id,now=new Date(),today=localDate(now);
+
+  // Fetch user's category
+  const[urows]=await pool.query('SELECT employee_category FROM users WHERE id=?',[userId]);
+  const category=(urows[0]?.employee_category)||'office';
+
   const[hols]=await pool.query('SELECT * FROM holidays WHERE holiday_date=?',[today]);
   if(hols.length) return res.status(400).json({error:`Today is a holiday: ${hols[0].name}`});
   const[ex]=await pool.query('SELECT * FROM attendance WHERE user_id=? AND work_date=?',[userId,today]);
   if(ex.length) return res.status(400).json({error:'Already clocked in today'});
-  await pool.query('INSERT INTO attendance(user_id,work_date,clock_in,clock_in_status) VALUES(?,?,?,?)',[userId,today,now,'pending']);
+
+  const eval_=evaluateClockIn(now,category);
+  const insertData={
+    user_id:userId, work_date:today, clock_in:now,
+    clock_in_status:eval_.clock_in_status,
+    clock_in_flag:eval_.flag,
+  };
+  if(eval_.approved_clock_in){
+    insertData.approved_clock_in=eval_.approved_clock_in;
+  }
+
+  await pool.query(`INSERT INTO attendance(user_id,work_date,clock_in,clock_in_status,clock_in_flag,approved_clock_in) VALUES(?,?,?,?,?,?)`,
+    [userId,today,now,eval_.clock_in_status,eval_.flag,eval_.approved_clock_in||null]);
+
   await ensureSundaysHolidays(today.slice(0,7)+'-01',localDate(new Date(now.getFullYear(),now.getMonth()+1,0)));
-  res.json({success:true,message:'Clocked in. Awaiting approval.',clock_in:now,status:'pending'});
+
+  const msg=eval_.clock_in_status==='approved'
+    ? (eval_.flag==='on_time'?'Clocked in — on time ✓':'Clocked in — recorded')
+    : (eval_.flag==='late'?'Clocked in late — awaiting manager approval':'Clocked in — awaiting approval');
+
+  res.json({success:true,message:msg,clock_in:now,status:eval_.clock_in_status,flag:eval_.flag,category,rules:getRulesForCategory(category)});
 }));
 
 app.post('/api/attendance/clock-out', auth, wrap(async(req,res)=>{
   if(req.user.role==='admin') return res.status(403).json({error:'Administrators do not clock out.'});
   const userId=req.user.id,now=new Date(),today=localDate(now);
+
+  const[urows]=await pool.query('SELECT employee_category FROM users WHERE id=?',[userId]);
+  const category=(urows[0]?.employee_category)||'office';
+
   const[rows]=await pool.query('SELECT * FROM attendance WHERE user_id=? AND work_date=?',[userId,today]);
   if(!rows.length) return res.status(400).json({error:'You have not clocked in today'});
   if(rows[0].clock_out) return res.status(400).json({error:'Already clocked out today'});
-  await pool.query('UPDATE attendance SET clock_out=?,clock_out_status=? WHERE id=?',[now,'pending',rows[0].id]);
-  res.json({success:true,message:'Clocked out. Awaiting approval.',clock_out:now,status:'pending'});
+
+  const eval_=evaluateClockOut(now,category);
+  let approved_co=eval_.approved_clock_out||null;
+
+  await pool.query('UPDATE attendance SET clock_out=?,clock_out_status=?,clock_out_flag=?,approved_clock_out=? WHERE id=?',
+    [now,eval_.clock_out_status,eval_.flag,approved_co,rows[0].id]);
+
+  const msg=eval_.clock_out_status==='approved'
+    ? 'Clocked out — recorded ✓'
+    : (eval_.flag==='early'?'Early clock-out flagged — awaiting manager approval':'Clocked out — awaiting approval');
+
+  res.json({success:true,message:msg,clock_out:now,status:eval_.clock_out_status,flag:eval_.flag});
 }));
+
+function getRulesForCategory(cat){
+  if(cat==='office') return {
+    ci:'08:45 – 09:10 (auto-approved)',co:'17:45 – 18:30 (auto-approved)',type:'office'
+  };
+  return {
+    ci:'Up to 09:35 on-time; after = late (needs approval)',co:'18:00 – 19:00 auto-approved; before 18:00 = early (needs approval)',type:'field'
+  };
+}
 
 app.get('/api/attendance/today', auth, wrap(async(req,res)=>{
   if(req.user.role==='admin') return res.json({record:null,holiday:null,today:localDate(),isAdmin:true});
-  const today=localDate(new Date());
-  const[rows]=await pool.query('SELECT * FROM attendance WHERE user_id=? AND work_date=?',[req.user.id,today]);
+  const userId=req.user.id,today=localDate(new Date());
+  const[rows]=await pool.query('SELECT * FROM attendance WHERE user_id=? AND work_date=?',[userId,today]);
   const[hols]=await pool.query('SELECT * FROM holidays WHERE holiday_date=?',[today]);
-  res.json({record:rows[0]||null,holiday:hols[0]||null,today,isAdmin:false});
+  const[urows]=await pool.query('SELECT employee_category,department FROM users WHERE id=?',[userId]);
+  const category=(urows[0]?.employee_category)||'office';
+  res.json({record:rows[0]||null,holiday:hols[0]||null,today,isAdmin:false,category,rules:getRulesForCategory(category)});
 }));
 
 app.get('/api/attendance/my', auth, wrap(async(req,res)=>{
@@ -724,37 +645,59 @@ app.get('/api/attendance/my', auth, wrap(async(req,res)=>{
   const report=[],holidayMap={},recordMap={};
   holidays.forEach(h=>holidayMap[h.holiday_date]=h);records.forEach(r=>recordMap[r.work_date]=r);
   for(let d=1;d<=lastD;d++){
-    const dateStr=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`,dow=new Date(dateStr+'T12:00:00').getDay(),today=localDate(new Date());
-    if(dateStr>today){report.push({date:dateStr,day_of_week:dow,type:'future'});continue;}
-    if(holidayMap[dateStr]){report.push({date:dateStr,day_of_week:dow,type:'holiday',holiday_name:holidayMap[dateStr].name,holiday_type:holidayMap[dateStr].type});continue;}
-    if(recordMap[dateStr]){report.push({date:dateStr,day_of_week:dow,type:'attendance',...recordMap[dateStr]});continue;}
-    report.push({date:dateStr,day_of_week:dow,type:'absent'});
+    const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`,dow=new Date(ds+'T12:00:00').getDay(),today=localDate(new Date());
+    if(ds>today){report.push({date:ds,day_of_week:dow,type:'future'});continue;}
+    if(holidayMap[ds]){report.push({date:ds,day_of_week:dow,type:'holiday',holiday_name:holidayMap[ds].name,holiday_type:holidayMap[ds].type});continue;}
+    if(recordMap[ds]){report.push({date:ds,day_of_week:dow,type:'attendance',...recordMap[ds]});continue;}
+    report.push({date:ds,day_of_week:dow,type:'absent'});
   }
-  const stats={approved:report.filter(d=>d.type==='attendance'&&d.clock_in_status==='approved').length,pending:report.filter(d=>d.type==='attendance'&&d.clock_in_status==='pending').length,absent:report.filter(d=>d.type==='absent').length,holidays:report.filter(d=>d.type==='holiday').length,total_work_hours:records.filter(r=>r.approved_clock_in&&r.approved_clock_out).reduce((s,r)=>s+(new Date(r.approved_clock_out)-new Date(r.approved_clock_in))/3600000,0).toFixed(1)};
+  const stats={
+    approved:report.filter(d=>d.type==='attendance'&&d.clock_in_status==='approved').length,
+    pending:report.filter(d=>d.type==='attendance'&&d.clock_in_status==='pending').length,
+    late:report.filter(d=>d.type==='attendance'&&d.clock_in_flag==='late').length,
+    absent:report.filter(d=>d.type==='absent').length,
+    holidays:report.filter(d=>d.type==='holiday').length,
+    total_work_hours:records.filter(r=>r.approved_clock_in&&r.approved_clock_out).reduce((s,r)=>s+(new Date(r.approved_clock_out)-new Date(r.approved_clock_in))/3600000,0).toFixed(1)
+  };
   res.json({report,stats,year:y,month:m});
 }));
 
+/* Admin: all attendance records */
 app.get('/api/admin/attendance', auth, adminOrSupervisor, wrap(async(req,res)=>{
   if(req.user.role==='supervisor'&&!req.user.permissions?.can_view_all_attendance) return res.status(403).json({error:'Permission denied'});
-  const{year,month,user_id,status}=req.query;
+  const{year,month,user_id,status,category}=req.query;
   const y=parseInt(year)||new Date().getFullYear(),m=parseInt(month)||new Date().getMonth()+1;
   const startDate=`${y}-${String(m).padStart(2,'0')}-01`,lastD=new Date(y,m,0).getDate();
   const endDate=`${y}-${String(m).padStart(2,'0')}-${String(lastD).padStart(2,'0')}`;
   await ensureSundaysHolidays(startDate,endDate);
-  let sql=`SELECT a.*,u.full_name,u.username,u.avatar_color,ab.full_name as approver_name,ab.username as approver_username,ab.avatar_color as approver_avatar_color,ab.role as approver_role FROM attendance a JOIN users u ON a.user_id=u.id LEFT JOIN users ab ON a.approved_by=ab.id WHERE a.work_date BETWEEN ? AND ?`;
+  let sql=`SELECT a.*,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,
+    ab.full_name as approver_name,ab.username as approver_username,ab.avatar_color as approver_avatar_color,ab.role as approver_role
+    FROM attendance a JOIN users u ON a.user_id=u.id LEFT JOIN users ab ON a.approved_by=ab.id
+    WHERE a.work_date BETWEEN ? AND ?`;
   const params=[startDate,endDate];
   if(user_id){sql+=' AND a.user_id=?';params.push(user_id);}
-  if(status==='pending'){sql+=" AND(a.clock_in_status='pending' OR a.clock_out_status='pending')";}else if(status){sql+=' AND a.clock_in_status=?';params.push(status);}
+  if(category){sql+=' AND u.employee_category=?';params.push(category);}
+  if(status==='pending'){sql+=" AND(a.clock_in_status='pending' OR a.clock_out_status='pending')";}
+  else if(status==='late'){sql+=" AND a.clock_in_flag='late'";}
+  else if(status==='early'){sql+=" AND a.clock_out_flag='early'";}
+  else if(status){sql+=' AND a.clock_in_status=?';params.push(status);}
   sql+=' ORDER BY a.work_date DESC,u.full_name';
   const[records]=await pool.query(sql,params);
   const[holidays]=await pool.query('SELECT * FROM holidays WHERE holiday_date BETWEEN ? AND ?',[startDate,endDate]);
-  const[users]=await pool.query("SELECT id,full_name,username,avatar_color FROM users WHERE is_active=1 AND role='member' ORDER BY full_name");
+  // Build per-user day reports — include all members + supervisors who clock in
+  const[users]=await pool.query(`SELECT id,full_name,username,avatar_color,employee_category,department FROM users WHERE is_active=1 AND role IN('member','supervisor') ORDER BY full_name`);
   const holidayMap={},userReports={};holidays.forEach(h=>holidayMap[h.holiday_date]=h);
   for(const u of users){
     userReports[u.id]={user:u,days:[]};const userRecs={};records.filter(r=>r.user_id===u.id).forEach(r=>userRecs[r.work_date]=r);
-    for(let d=1;d<=lastD;d++){const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`,today=localDate(new Date());if(ds>today)continue;if(holidayMap[ds]){userReports[u.id].days.push({date:ds,type:'holiday',name:holidayMap[ds].name,holiday_type:holidayMap[ds].type});continue;}if(userRecs[ds]){userReports[u.id].days.push({date:ds,type:'attendance',...userRecs[ds]});continue;}userReports[u.id].days.push({date:ds,type:'absent'});}
+    for(let d=1;d<=lastD;d++){
+      const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`,today=localDate(new Date());
+      if(ds>today)continue;
+      if(holidayMap[ds]){userReports[u.id].days.push({date:ds,type:'holiday',name:holidayMap[ds].name,holiday_type:holidayMap[ds].type});continue;}
+      if(userRecs[ds]){userReports[u.id].days.push({date:ds,type:'attendance',...userRecs[ds]});continue;}
+      userReports[u.id].days.push({date:ds,type:'absent'});
+    }
   }
-  const[[totals]]=await pool.query(`SELECT COUNT(*) as total,SUM(clock_in_status='pending') as pending,SUM(clock_in_status='approved') as approved,SUM(clock_in_status='rejected') as rejected FROM attendance WHERE work_date BETWEEN ? AND ?`,[startDate,endDate]);
+  const[[totals]]=await pool.query(`SELECT COUNT(*) as total,SUM(clock_in_status='pending') as pending,SUM(clock_in_status='approved') as approved,SUM(clock_in_status='rejected') as rejected,SUM(clock_in_flag='late') as late_checkins,SUM(clock_out_flag='early') as early_checkouts FROM attendance WHERE work_date BETWEEN ? AND ?`,[startDate,endDate]);
   res.json({records,holidays,userReports:Object.values(userReports),stats:totals,year:y,month:m});
 }));
 
@@ -765,9 +708,28 @@ app.put('/api/admin/attendance/:id', auth, adminOrSupervisor, wrap(async(req,res
   const[rows]=await pool.query('SELECT * FROM attendance WHERE id=?',[id]);
   if(!rows.length) return res.status(404).json({error:'Record not found'});
   const rec=rows[0];const u=[],v=[];
-  if(clock_in_status!==undefined){u.push('clock_in_status=?');v.push(clock_in_status);if(clock_in_status==='approved'){const cin=approved_clock_in!==undefined?approved_clock_in:rec.clock_in;u.push('approved_clock_in=?');v.push(toMySQL(cin));u.push('approved_by=?');v.push(req.user.id);u.push('approved_at=NOW()');}}
-  if(clock_out_status!==undefined){u.push('clock_out_status=?');v.push(clock_out_status);if(clock_out_status==='approved'){const cout=approved_clock_out!==undefined?approved_clock_out:rec.clock_out;u.push('approved_clock_out=?');v.push(toMySQL(cout));if(clock_in_status===undefined){u.push('approved_by=?');v.push(req.user.id);u.push('approved_at=NOW()');}}}
-  if(clock_in_status===undefined&&clock_out_status===undefined){if(approved_clock_in!==undefined){u.push('approved_clock_in=?');v.push(toMySQL(approved_clock_in));}if(approved_clock_out!==undefined){u.push('approved_clock_out=?');v.push(toMySQL(approved_clock_out));}}
+  if(clock_in_status!==undefined){
+    u.push('clock_in_status=?');v.push(clock_in_status);
+    if(clock_in_status==='approved'){
+      const cin=approved_clock_in!==undefined?approved_clock_in:rec.clock_in;
+      u.push('approved_clock_in=?');v.push(toMySQL(cin));
+      u.push('approved_by=?');v.push(req.user.id);
+      u.push('approved_at=NOW()');
+    }
+    if(clock_in_status==='rejected'){u.push('approved_by=?');v.push(req.user.id);u.push('approved_at=NOW()');}
+  }
+  if(clock_out_status!==undefined){
+    u.push('clock_out_status=?');v.push(clock_out_status);
+    if(clock_out_status==='approved'){
+      const cout=approved_clock_out!==undefined?approved_clock_out:rec.clock_out;
+      u.push('approved_clock_out=?');v.push(toMySQL(cout));
+      if(clock_in_status===undefined){u.push('approved_by=?');v.push(req.user.id);u.push('approved_at=NOW()');}
+    }
+  }
+  if(clock_in_status===undefined&&clock_out_status===undefined){
+    if(approved_clock_in!==undefined){u.push('approved_clock_in=?');v.push(toMySQL(approved_clock_in));}
+    if(approved_clock_out!==undefined){u.push('approved_clock_out=?');v.push(toMySQL(approved_clock_out));}
+  }
   if(admin_note!==undefined){u.push('admin_note=?');v.push(admin_note);}
   if(!u.length) return res.status(400).json({error:'Nothing to update'});
   v.push(id);await pool.query(`UPDATE attendance SET ${u.join(',')} WHERE id=?`,v);
@@ -782,19 +744,75 @@ app.post('/api/admin/attendance/bulk-approve', auth, adminOrSupervisor, wrap(asy
   res.json({success:true});
 }));
 
+/* Admin attendance stats — comprehensive with category breakdown */
 app.get('/api/admin/attendance/stats', auth, adminOrSupervisor, wrap(async(req,res)=>{
   if(req.user.role==='supervisor'&&!req.user.permissions?.can_view_all_attendance) return res.status(403).json({error:'Permission denied'});
-  const{year,month}=req.query;const y=parseInt(year)||new Date().getFullYear(),m=parseInt(month)||new Date().getMonth()+1;
+  const{year,month}=req.query;
+  const y=parseInt(year)||new Date().getFullYear(),m=parseInt(month)||new Date().getMonth()+1;
   const startDate=`${y}-${String(m).padStart(2,'0')}-01`,lastD=new Date(y,m,0).getDate();
   const endDate=`${y}-${String(m).padStart(2,'0')}-${String(lastD).padStart(2,'0')}`;
   await ensureSundaysHolidays(startDate,endDate);
-  const[[overall]]=await pool.query(`SELECT COUNT(*) as total_checkins,SUM(clock_in_status='pending') as pending,SUM(clock_in_status='approved') as approved,SUM(clock_in_status='rejected') as rejected,COUNT(DISTINCT user_id) as unique_users FROM attendance WHERE work_date BETWEEN ? AND ?`,[startDate,endDate]);
-  const[perUser]=await pool.query(`SELECT u.id,u.full_name,u.username,u.avatar_color,COUNT(a.id) as check_ins,SUM(a.clock_in_status='approved') as approved,SUM(a.clock_in_status='pending') as pending,SUM(a.clock_in_status='rejected') as rejected FROM users u LEFT JOIN attendance a ON u.id=a.user_id AND a.work_date BETWEEN ? AND ? WHERE u.is_active=1 AND u.role='member' GROUP BY u.id ORDER BY approved DESC`,[startDate,endDate]);
-  const[daily]=await pool.query(`SELECT work_date as date,COUNT(*) as total,SUM(clock_in_status='approved') as approved,SUM(clock_in_status='pending') as pending FROM attendance WHERE work_date BETWEEN ? AND ? GROUP BY work_date ORDER BY work_date`,[startDate,endDate]);
+
+  // Overall
+  const[[overall]]=await pool.query(`SELECT
+    COUNT(*) as total_checkins,
+    SUM(clock_in_status='pending') as pending,
+    SUM(clock_in_status='approved') as approved,
+    SUM(clock_in_status='rejected') as rejected,
+    SUM(clock_in_flag='late') as late_checkins,
+    SUM(clock_out_flag='early') as early_checkouts,
+    COUNT(DISTINCT user_id) as unique_users
+    FROM attendance WHERE work_date BETWEEN ? AND ?`,[startDate,endDate]);
+
+  // Per employee with category
+  const[perUser]=await pool.query(`SELECT
+    u.id,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,
+    COUNT(a.id) as check_ins,
+    COALESCE(SUM(a.clock_in_status='approved'),0) as approved,
+    COALESCE(SUM(a.clock_in_status='pending'),0) as pending,
+    COALESCE(SUM(a.clock_in_status='rejected'),0) as rejected,
+    COALESCE(SUM(a.clock_in_flag='late'),0) as late,
+    COALESCE(SUM(a.clock_out_flag='early'),0) as early_out
+    FROM users u
+    LEFT JOIN attendance a ON u.id=a.user_id AND a.work_date BETWEEN ? AND ?
+    WHERE u.is_active=1 AND u.role IN('member','supervisor')
+    GROUP BY u.id ORDER BY u.employee_category,u.full_name`,[startDate,endDate]);
+
+  // Daily breakdown
+  const[daily]=await pool.query(`SELECT
+    work_date as date,
+    COUNT(*) as total,
+    SUM(clock_in_status='approved') as approved,
+    SUM(clock_in_status='pending') as pending,
+    SUM(clock_in_flag='late') as late
+    FROM attendance WHERE work_date BETWEEN ? AND ? GROUP BY work_date ORDER BY work_date`,[startDate,endDate]);
+
   const[holidays]=await pool.query('SELECT * FROM holidays WHERE holiday_date BETWEEN ? AND ? ORDER BY holiday_date',[startDate,endDate]);
+
+  // Compute working days up to today
   const today=localDate(new Date()),holidayDates=new Set(holidays.map(h=>h.holiday_date));
-  let workingDays=0;for(let d=1;d<=lastD;d++){const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;if(ds<=today&&!holidayDates.has(ds))workingDays++;}
-  res.json({overall,perUser,daily,holidays,workingDays,year:y,month:m});
+  let workingDays=0;
+  for(let d=1;d<=lastD;d++){
+    const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    if(ds<=today&&!holidayDates.has(ds))workingDays++;
+  }
+
+  // Category totals
+  const[[office]]=await pool.query(`SELECT COUNT(DISTINCT u.id) as total_users,
+    COALESCE(SUM(a.clock_in_status='approved'),0) as approved,
+    COALESCE(SUM(a.clock_in_status='pending'),0) as pending,
+    COALESCE(SUM(a.clock_in_flag='late'),0) as late
+    FROM users u LEFT JOIN attendance a ON u.id=a.user_id AND a.work_date BETWEEN ? AND ?
+    WHERE u.is_active=1 AND u.employee_category='office' AND u.role IN('member','supervisor')`,[startDate,endDate]);
+  const[[field]]=await pool.query(`SELECT COUNT(DISTINCT u.id) as total_users,
+    COALESCE(SUM(a.clock_in_status='approved'),0) as approved,
+    COALESCE(SUM(a.clock_in_status='pending'),0) as pending,
+    COALESCE(SUM(a.clock_in_flag='late'),0) as late,
+    COALESCE(SUM(a.clock_out_flag='early'),0) as early_out
+    FROM users u LEFT JOIN attendance a ON u.id=a.user_id AND a.work_date BETWEEN ? AND ?
+    WHERE u.is_active=1 AND u.employee_category='field' AND u.role IN('member','supervisor')`,[startDate,endDate]);
+
+  res.json({overall,perUser,daily,holidays,workingDays,office,field,year:y,month:m});
 }));
 
 app.post('/api/admin/holidays', auth, adminOrSupervisor, wrap(async(req,res)=>{
@@ -810,7 +828,7 @@ app.delete('/api/admin/holidays/:date', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 /* ══════════════════════════════════════
-   ADMIN TASK STATS (comprehensive)
+   ADMIN TASK STATS
 ══════════════════════════════════════ */
 app.get('/api/admin/stats', auth, adminOnly, wrap(async(req,res)=>{
   const[[totals]]=await pool.query(`SELECT COUNT(*) as total_tasks,SUM(status='todo') as todo,SUM(status='in_progress') as in_progress,SUM(status='review') as review,SUM(status='done') as done,SUM(priority='urgent') as urgent,SUM(priority='high') as high,SUM(priority='medium') as medium,SUM(priority='low') as low_p,SUM(due_date<CURDATE() AND status!='done') as overdue,SUM(due_date>=CURDATE() AND due_date<=DATE_ADD(CURDATE(),INTERVAL 7 DAY) AND status!='done') as due_this_week FROM tasks`);
