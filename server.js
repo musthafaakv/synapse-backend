@@ -1720,3 +1720,15 @@ app.post('/api/admin/smtp/test-send', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 
+
+
+/* ══════════════════════════════════════
+   START SERVER
+══════════════════════════════════════ */
+const PORT = process.env.PORT || 3001;
+initDB().then(() => {
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}).catch(err => {
+  console.error('Database init failed:', err);
+  process.exit(1);
+});
