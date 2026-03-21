@@ -150,12 +150,42 @@ async function setupDatabase(){
     /* ── Migrations for existing installs ── */
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
     await c.query(`ALTER TABLE notifications MODIFY COLUMN type VARCHAR(50) DEFAULT 'assigned'`).catch(()=>{});
-    /* Migrate old task_history schema if columns differ */
-    await c.query(`ALTER TABLE task_history ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 1`).catch(()=>{});
-    await c.query(`ALTER TABLE task_history ADD COLUMN IF NOT EXISTS comment TEXT`).catch(()=>{});
-    await c.query(`ALTER TABLE task_history MODIFY COLUMN action VARCHAR(100) NOT NULL`).catch(()=>{});
-    /* rename changed_by_id → user_id if old schema exists */
+
+    /* Safely rename changed_by_id → user_id (old schema) */
     await c.query(`ALTER TABLE task_history CHANGE COLUMN changed_by_id user_id INT NOT NULL`).catch(()=>{});
+
+    /* Add user_id if completely missing */
+    await c.query(`ALTER TABLE task_history ADD COLUMN user_id INT NOT NULL DEFAULT 1`).catch(()=>{});
+
+    /* Add comment column — use a workaround for MySQL versions without IF NOT EXISTS */
+    const[commentCol]=await c.query(
+      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_history' AND COLUMN_NAME='comment'"
+    );
+    if(!commentCol.length){
+      await c.query(`ALTER TABLE task_history ADD COLUMN comment TEXT`);
+      console.log('✅ Added comment column to task_history');
+    }
+
+    /* Add field column if missing */
+    const[fieldCol]=await c.query(
+      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_history' AND COLUMN_NAME='field'"
+    );
+    if(!fieldCol.length){
+      await c.query(`ALTER TABLE task_history ADD COLUMN field VARCHAR(50)`);
+      console.log('✅ Added field column to task_history');
+    }
+
+    /* Add old_value/new_value columns if missing */
+    const[ovCol]=await c.query(
+      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_history' AND COLUMN_NAME='old_value'"
+    );
+    if(!ovCol.length){
+      await c.query(`ALTER TABLE task_history ADD COLUMN old_value TEXT`);
+      await c.query(`ALTER TABLE task_history ADD COLUMN new_value TEXT`);
+      console.log('✅ Added old_value/new_value columns to task_history');
+    }
+
+    await c.query(`ALTER TABLE task_history MODIFY COLUMN action VARCHAR(100) NOT NULL`).catch(()=>{});
 
     /* Seed */
     const hash = await bcrypt.hash('Admin@1234',10);
