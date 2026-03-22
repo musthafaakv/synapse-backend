@@ -326,6 +326,20 @@ async function setupDatabase(){
     await c.query('ALTER TABLE quotation_items ADD COLUMN show_description TINYINT(1) DEFAULT 1').catch(()=>{});
     await c.query('ALTER TABLE quotation_items ADD COLUMN inventory_id INT DEFAULT NULL').catch(()=>{});
 
+    await c.query(`CREATE TABLE IF NOT EXISTS quotation_follow_ups(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      quotation_id INT NOT NULL,
+      comment TEXT NOT NULL,
+      created_by INT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(quotation_id) REFERENCES quotations(id) ON DELETE CASCADE,
+      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE CASCADE)`);
+
+    /* Migrations for quotations table */
+    await c.query("ALTER TABLE quotations ADD COLUMN version INT DEFAULT 1").catch(()=>{});
+    await c.query("ALTER TABLE quotations ADD COLUMN quotation_number_custom VARCHAR(100) DEFAULT NULL").catch(()=>{});
+    await c.query("ALTER TABLE quotations MODIFY COLUMN status ENUM('created','draft','sent','accepted','rejected') DEFAULT 'created'").catch(()=>{});
+
 
     /* Migrations */
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
@@ -1451,11 +1465,11 @@ app.get('/api/quotations/:id', auth, wrap(async(req,res)=>{
 }));
 
 app.post('/api/quotations', auth, wrap(async(req,res)=>{
-  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items}=req.body;
-  const qnum=await nextQuotationNumber();
+  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items,quotation_number_custom}=req.body;
+  const qnum=quotation_number_custom||await nextQuotationNumber();
   const[r]=await pool.query(
-    'INSERT INTO quotations(quotation_number,quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-    [qnum,quotation_date,valid_till||null,subject||null,client_id||null,client_name||null,client_email||null,client_phone||null,client_address||null,client_trn||null,currency||'AED',vat_rate??5,subtotal||0,vat_amount||0,discount_amount||0,total||0,notes||null,status||'draft',req.user.id]);
+    'INSERT INTO quotations(quotation_number,quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,created_by,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [qnum,quotation_date,valid_till||null,subject||null,client_id||null,client_name||null,client_email||null,client_phone||null,client_address||null,client_trn||null,currency||'AED',vat_rate??5,subtotal||0,vat_amount||0,discount_amount||0,total||0,notes||null,status||'created',req.user.id,1]);
   const qid=r.insertId;
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
@@ -1468,10 +1482,14 @@ app.post('/api/quotations', auth, wrap(async(req,res)=>{
 }));
 
 app.put('/api/quotations/:id', auth, wrap(async(req,res)=>{
-  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items}=req.body;
+  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items,quotation_number_custom,version}=req.body;
+  /* Get current version to auto-increment */
+  const[[cur]]=await pool.query('SELECT version,quotation_number FROM quotations WHERE id=?',[req.params.id]);
+  const newVersion=version!=null?parseInt(version):(parseInt(cur?.version||1)+1);
+  const newQnum=quotation_number_custom||cur?.quotation_number;
   await pool.query(
-    'UPDATE quotations SET quotation_date=?,valid_till=?,subject=?,client_id=?,client_name=?,client_email=?,client_phone=?,client_address=?,client_trn=?,currency=?,vat_rate=?,subtotal=?,vat_amount=?,discount_amount=?,total=?,notes=?,status=?,updated_at=NOW() WHERE id=?',
-    [quotation_date,valid_till||null,subject||null,client_id||null,client_name||null,client_email||null,client_phone||null,client_address||null,client_trn||null,currency||'AED',vat_rate??5,subtotal||0,vat_amount||0,discount_amount||0,total||0,notes||null,status||'draft',req.params.id]);
+    'UPDATE quotations SET quotation_number=?,quotation_date=?,valid_till=?,subject=?,client_id=?,client_name=?,client_email=?,client_phone=?,client_address=?,client_trn=?,currency=?,vat_rate=?,subtotal=?,vat_amount=?,discount_amount=?,total=?,notes=?,status=?,version=?,updated_at=NOW() WHERE id=?',
+    [newQnum,quotation_date,valid_till||null,subject||null,client_id||null,client_name||null,client_email||null,client_phone||null,client_address||null,client_trn||null,currency||'AED',vat_rate??5,subtotal||0,vat_amount||0,discount_amount||0,total||0,notes||null,status||'created',newVersion,req.params.id]);
   await pool.query('DELETE FROM quotation_items WHERE quotation_id=?',[req.params.id]);
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
@@ -1520,6 +1538,31 @@ app.put('/api/inventory/:id', auth, wrap(async(req,res)=>{
 
 app.delete('/api/inventory/:id', auth, wrap(async(req,res)=>{
   await pool.query('UPDATE inventory SET is_active=0 WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+/* ══════════════════════════════════════
+   QUOTATION FOLLOW-UPS
+══════════════════════════════════════ */
+app.get('/api/quotations/:id/followups', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT f.*,u.full_name,u.role FROM quotation_follow_ups f JOIN users u ON f.created_by=u.id WHERE f.quotation_id=? ORDER BY f.created_at ASC',
+    [req.params.id]);
+  res.json(rows);
+}));
+
+app.post('/api/quotations/:id/followups', auth, wrap(async(req,res)=>{
+  const{comment}=req.body;
+  if(!comment||!comment.trim()) return res.status(400).json({error:'Comment required'});
+  const[r]=await pool.query(
+    'INSERT INTO quotation_follow_ups(quotation_id,comment,created_by) VALUES(?,?,?)',
+    [req.params.id,comment.trim(),req.user.id]);
+  res.json({success:true,id:r.insertId});
+}));
+
+app.delete('/api/quotations/:id/followups/:fid', auth, wrap(async(req,res)=>{
+  if(req.user.role!=='admin') return res.status(403).json({error:'Admin only'});
+  await pool.query('DELETE FROM quotation_follow_ups WHERE id=? AND quotation_id=?',[req.params.fid,req.params.id]);
   res.json({success:true});
 }));
 
