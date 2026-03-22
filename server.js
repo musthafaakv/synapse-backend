@@ -1460,8 +1460,8 @@ app.post('/api/quotations', auth, wrap(async(req,res)=>{
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
       const it=items[i];
-      await pool.query('INSERT INTO quotation_items(quotation_id,sort_order,item_name,description,quantity,unit_price,amount) VALUES(?,?,?,?,?,?,?)',
-        [qid,i,it.item_name||'',it.description||null,it.quantity||1,it.unit_price||0,it.amount||0]);
+      await pool.query('INSERT INTO quotation_items(quotation_id,sort_order,item_name,description,quantity,unit_price,amount,show_description,inventory_id) VALUES(?,?,?,?,?,?,?,?,?)',
+        [qid,i,it.item_name||'',it.description||null,it.quantity||1,it.unit_price||0,it.amount||0,it.show_description!==false?1:0,it.inventory_id||null]);
     }
   }
   res.json({success:true,id:qid,quotation_number:qnum});
@@ -1476,8 +1476,8 @@ app.put('/api/quotations/:id', auth, wrap(async(req,res)=>{
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
       const it=items[i];
-      await pool.query('INSERT INTO quotation_items(quotation_id,sort_order,item_name,description,quantity,unit_price,amount) VALUES(?,?,?,?,?,?,?)',
-        [req.params.id,i,it.item_name||'',it.description||null,it.quantity||1,it.unit_price||0,it.amount||0]);
+      await pool.query('INSERT INTO quotation_items(quotation_id,sort_order,item_name,description,quantity,unit_price,amount,show_description,inventory_id) VALUES(?,?,?,?,?,?,?,?,?)',
+        [req.params.id,i,it.item_name||'',it.description||null,it.quantity||1,it.unit_price||0,it.amount||0,it.show_description!==false?1:0,it.inventory_id||null]);
     }
   }
   res.json({success:true});
