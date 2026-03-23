@@ -335,6 +335,42 @@ async function setupDatabase(){
       FOREIGN KEY(quotation_id) REFERENCES quotations(id) ON DELETE CASCADE,
       FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE CASCADE)`);
 
+    await c.query(`CREATE TABLE IF NOT EXISTS delivery_notes(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      dn_number VARCHAR(100) NOT NULL,
+      dn_date DATE NOT NULL,
+      status ENUM('draft','issued','delivered','cancelled') DEFAULT 'draft',
+      version INT DEFAULT 1,
+      client_id INT DEFAULT NULL,
+      client_name VARCHAR(255) DEFAULT NULL,
+      client_address TEXT DEFAULT NULL,
+      client_phone VARCHAR(100) DEFAULT NULL,
+      delivery_person_id INT NOT NULL,
+      delivery_person_name VARCHAR(255) DEFAULT NULL,
+      notes TEXT DEFAULT NULL,
+      created_by INT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS delivery_note_items(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      dn_id INT NOT NULL,
+      sort_order INT DEFAULT 0,
+      inventory_id INT DEFAULT NULL,
+      item_name VARCHAR(255) NOT NULL,
+      description TEXT DEFAULT NULL,
+      quantity DECIMAL(10,2) DEFAULT 1,
+      unit VARCHAR(50) DEFAULT NULL,
+      serial_number VARCHAR(255) DEFAULT NULL,
+      FOREIGN KEY(dn_id) REFERENCES delivery_notes(id) ON DELETE CASCADE)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS dn_tc_templates(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      label VARCHAR(255) NOT NULL,
+      text TEXT NOT NULL,
+      created_by INT DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+
     /* Migrations for quotations table */
     await c.query("ALTER TABLE quotations ADD COLUMN version INT DEFAULT 1").catch(()=>{});
     await c.query("ALTER TABLE quotations ADD COLUMN quotation_number_custom VARCHAR(100) DEFAULT NULL").catch(()=>{});
@@ -1449,6 +1485,17 @@ async function nextQuotationNumber(){
   return 'QT/CCT/'+year+'-'+seq;
 }
 
+async function nextDNNumber(){
+  const year=new Date().getFullYear();
+  const[rows]=await pool.query(
+    "SELECT dn_number FROM delivery_notes WHERE dn_number LIKE ? ORDER BY id DESC LIMIT 1",
+    [`DN/CCT/${year}-%`]);
+  if(!rows.length) return `DN/CCT/${year}-001`;
+  const last=rows[0].dn_number;
+  const seq=parseInt(last.split('-').pop())||0;
+  return `DN/CCT/${year}-${String(seq+1).padStart(3,'0')}`;
+}
+
 app.get('/api/quotations', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(
     'SELECT q.*,u.full_name as creator_name FROM quotations q LEFT JOIN users u ON q.created_by=u.id ORDER BY q.created_at DESC');
@@ -1563,6 +1610,91 @@ app.post('/api/quotations/:id/followups', auth, wrap(async(req,res)=>{
 app.delete('/api/quotations/:id/followups/:fid', auth, wrap(async(req,res)=>{
   if(req.user.role!=='admin') return res.status(403).json({error:'Admin only'});
   await pool.query('DELETE FROM quotation_follow_ups WHERE id=? AND quotation_id=?',[req.params.fid,req.params.id]);
+  res.json({success:true});
+}));
+
+/* ══════════════════════════════════════
+   DELIVERY NOTES
+══════════════════════════════════════ */
+app.get('/api/delivery-notes', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT d.*,u.full_name as creator_name FROM delivery_notes d LEFT JOIN users u ON d.created_by=u.id ORDER BY d.id DESC');
+  res.json(rows);
+}));
+
+app.get('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
+  const[[d]]=await pool.query('SELECT d.*,u.full_name as creator_name FROM delivery_notes d LEFT JOIN users u ON d.created_by=u.id WHERE d.id=?',[req.params.id]);
+  if(!d) return res.status(404).json({error:'Not found'});
+  const[items]=await pool.query('SELECT * FROM delivery_note_items WHERE dn_id=? ORDER BY sort_order',[req.params.id]);
+  res.json(Object.assign(d,{items}));
+}));
+
+app.post('/api/delivery-notes', auth, wrap(async(req,res)=>{
+  const{dn_date,status,client_id,client_name,client_address,client_phone,delivery_person_id,delivery_person_name,notes,items,dn_number_custom}=req.body;
+  const dnNum=dn_number_custom||await nextDNNumber();
+  const[[dp]]=await pool.query('SELECT full_name FROM users WHERE id=?',[delivery_person_id||req.user.id]);
+  const[r]=await pool.query(
+    'INSERT INTO delivery_notes(dn_number,dn_date,status,client_id,client_name,client_address,client_phone,delivery_person_id,delivery_person_name,notes,created_by,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)',
+    [dnNum,dn_date,status||'draft',client_id||null,client_name||null,client_address||null,client_phone||null,
+     delivery_person_id||req.user.id,delivery_person_name||(dp&&dp.full_name)||null,notes||null,req.user.id]);
+  const dnId=r.insertId;
+  if(items&&items.length){
+    for(let i=0;i<items.length;i++){
+      const it=items[i];
+      await pool.query('INSERT INTO delivery_note_items(dn_id,sort_order,inventory_id,item_name,description,quantity,unit,serial_number) VALUES(?,?,?,?,?,?,?,?)',
+        [dnId,i,it.inventory_id||null,it.item_name||'',it.description||null,it.quantity||1,it.unit||null,it.serial_number||null]);
+    }
+  }
+  res.json({success:true,id:dnId,dn_number:dnNum});
+}));
+
+app.put('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
+  const{dn_date,status,client_id,client_name,client_address,client_phone,delivery_person_id,delivery_person_name,notes,items,dn_number_custom,version}=req.body;
+  const[[cur]]=await pool.query('SELECT version,dn_number FROM delivery_notes WHERE id=?',[req.params.id]);
+  const newVer=version!=null?parseInt(version):(parseInt(cur&&cur.version||1)+1);
+  const newNum=dn_number_custom||cur&&cur.dn_number;
+  await pool.query(
+    'UPDATE delivery_notes SET dn_number=?,dn_date=?,status=?,client_id=?,client_name=?,client_address=?,client_phone=?,delivery_person_id=?,delivery_person_name=?,notes=?,version=?,updated_at=NOW() WHERE id=?',
+    [newNum,dn_date,status||'draft',client_id||null,client_name||null,client_address||null,client_phone||null,
+     delivery_person_id||null,delivery_person_name||null,notes||null,newVer,req.params.id]);
+  await pool.query('DELETE FROM delivery_note_items WHERE dn_id=?',[req.params.id]);
+  if(items&&items.length){
+    for(let i=0;i<items.length;i++){
+      const it=items[i];
+      await pool.query('INSERT INTO delivery_note_items(dn_id,sort_order,inventory_id,item_name,description,quantity,unit,serial_number) VALUES(?,?,?,?,?,?,?,?)',
+        [req.params.id,i,it.inventory_id||null,it.item_name||'',it.description||null,it.quantity||1,it.unit||null,it.serial_number||null]);
+    }
+  }
+  res.json({success:true,dn_number:newNum});
+}));
+
+app.delete('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
+  const[[d]]=await pool.query('SELECT created_by FROM delivery_notes WHERE id=?',[req.params.id]);
+  if(!d) return res.status(404).json({error:'Not found'});
+  if(req.user.role!=='admin'&&d.created_by!==req.user.id) return res.status(403).json({error:'Forbidden'});
+  await pool.query('DELETE FROM delivery_notes WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+/* DN T&C Templates */
+app.get('/api/dn-tc', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM dn_tc_templates ORDER BY id');
+  res.json(rows);
+}));
+app.post('/api/dn-tc', auth, wrap(async(req,res)=>{
+  const{label,text}=req.body;
+  if(!label||!text) return res.status(400).json({error:'Label and text required'});
+  const[r]=await pool.query('INSERT INTO dn_tc_templates(label,text,created_by) VALUES(?,?,?)',[label,text,req.user.id]);
+  res.json({success:true,id:r.insertId});
+}));
+app.put('/api/dn-tc/:id', auth, wrap(async(req,res)=>{
+  const{label,text}=req.body;
+  await pool.query('UPDATE dn_tc_templates SET label=?,text=? WHERE id=?',[label,text,req.params.id]);
+  res.json({success:true});
+}));
+app.delete('/api/dn-tc/:id', auth, wrap(async(req,res)=>{
+  if(req.user.role!=='admin') return res.status(403).json({error:'Admin only'});
+  await pool.query('DELETE FROM dn_tc_templates WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
 
