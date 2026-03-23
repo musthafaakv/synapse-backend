@@ -335,6 +335,25 @@ async function setupDatabase(){
       FOREIGN KEY(quotation_id) REFERENCES quotations(id) ON DELETE CASCADE,
       FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE CASCADE)`);
 
+    await c.query(`CREATE TABLE IF NOT EXISTS attendance_categories(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      work_start TIME NOT NULL DEFAULT '09:00:00',
+      work_end TIME NOT NULL DEFAULT '18:00:00',
+      grace_minutes INT DEFAULT 15,
+      late_after_minutes INT DEFAULT 30,
+      approved_start TIME DEFAULT NULL,
+      approved_end TIME DEFAULT NULL,
+      is_default TINYINT(1) DEFAULT 0,
+      is_active TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+
+    /* Seed default category if empty */
+    const[catRows]=await c.query('SELECT COUNT(*) as cnt FROM attendance_categories');
+    if(catRows[0].cnt===0){
+      await c.query("INSERT INTO attendance_categories(name,work_start,work_end,grace_minutes,late_after_minutes,is_default) VALUES('Standard',?,'18:00:00',15,30,1)",['09:00:00']);
+    }
+
     await c.query(`CREATE TABLE IF NOT EXISTS delivery_notes(
       id INT AUTO_INCREMENT PRIMARY KEY,
       dn_number VARCHAR(100) NOT NULL,
@@ -378,6 +397,8 @@ async function setupDatabase(){
 
 
     /* Migrations */
+    await c.query('ALTER TABLE attendance ADD COLUMN category_id INT DEFAULT NULL').catch(()=>{});
+    await c.query('ALTER TABLE attendance ADD COLUMN notes TEXT DEFAULT NULL').catch(()=>{});
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN employee_category ENUM('office','field') DEFAULT 'office'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE`).catch(()=>{});
@@ -1610,6 +1631,51 @@ app.post('/api/quotations/:id/followups', auth, wrap(async(req,res)=>{
 app.delete('/api/quotations/:id/followups/:fid', auth, wrap(async(req,res)=>{
   if(req.user.role!=='admin') return res.status(403).json({error:'Admin only'});
   await pool.query('DELETE FROM quotation_follow_ups WHERE id=? AND quotation_id=?',[req.params.fid,req.params.id]);
+  res.json({success:true});
+}));
+
+/* ══════════════════════════════════════
+   ATTENDANCE CATEGORIES
+══════════════════════════════════════ */
+app.get('/api/admin/att-categories', auth, adminOnly, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM attendance_categories WHERE is_active=1 ORDER BY is_default DESC,name');
+  res.json(rows);
+}));
+
+app.post('/api/admin/att-categories', auth, adminOnly, wrap(async(req,res)=>{
+  const{name,work_start,work_end,grace_minutes,late_after_minutes,approved_start,approved_end,is_default}=req.body;
+  if(!name||!work_start||!work_end) return res.status(400).json({error:'Name, start and end time required'});
+  if(is_default){
+    await pool.query('UPDATE attendance_categories SET is_default=0');
+  }
+  const[r]=await pool.query(
+    'INSERT INTO attendance_categories(name,work_start,work_end,grace_minutes,late_after_minutes,approved_start,approved_end,is_default) VALUES(?,?,?,?,?,?,?,?)',
+    [name,work_start,work_end,grace_minutes??15,late_after_minutes??30,approved_start||null,approved_end||null,is_default?1:0]);
+  res.json({success:true,id:r.insertId});
+}));
+
+app.put('/api/admin/att-categories/:id', auth, adminOnly, wrap(async(req,res)=>{
+  const{name,work_start,work_end,grace_minutes,late_after_minutes,approved_start,approved_end,is_default}=req.body;
+  if(is_default){
+    await pool.query('UPDATE attendance_categories SET is_default=0');
+  }
+  await pool.query(
+    'UPDATE attendance_categories SET name=?,work_start=?,work_end=?,grace_minutes=?,late_after_minutes=?,approved_start=?,approved_end=?,is_default=? WHERE id=?',
+    [name,work_start,work_end,grace_minutes??15,late_after_minutes??30,approved_start||null,approved_end||null,is_default?1:0,req.params.id]);
+  res.json({success:true});
+}));
+
+app.delete('/api/admin/att-categories/:id', auth, adminOnly, wrap(async(req,res)=>{
+  await pool.query('UPDATE attendance_categories SET is_active=0 WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+/* Override check-in/out time for a specific attendance record */
+app.put('/api/admin/attendance/:id/override-time', auth, adminOnly, wrap(async(req,res)=>{
+  const{clock_in,clock_out,category_id,notes}=req.body;
+  await pool.query(
+    'UPDATE attendance SET clock_in=COALESCE(?,clock_in),clock_out=COALESCE(?,clock_out),category_id=COALESCE(?,category_id),notes=COALESCE(?,notes),updated_at=NOW() WHERE id=?',
+    [clock_in||null,clock_out||null,category_id||null,notes||null,req.params.id]);
   res.json({success:true});
 }));
 
