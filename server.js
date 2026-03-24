@@ -517,6 +517,7 @@ app.get('/api/users', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(`
     SELECT u.id,u.username,u.email,u.full_name,u.role,u.employee_category,u.department,
       u.avatar_color,u.is_active,u.must_change_password,u.last_login_at,u.last_login_ip,u.created_at,
+      u.schedule_id,
       sp.can_approve_attendance,sp.can_view_all_attendance,sp.can_edit_tasks,
       sp.can_create_tasks,sp.can_view_all_tasks,sp.can_manage_holidays
     FROM users u LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id ORDER BY u.full_name`);
@@ -524,13 +525,13 @@ app.get('/api/users', auth, wrap(async(req,res)=>{
 }));
 
 app.post('/api/users', auth, adminOnly, wrap(async(req,res)=>{
-  const{username,email,password,full_name,role,employee_category,department}=req.body;
-  if(!username||!email||!password) return res.status(400).json({error:'Missing fields'});
+  const{username,email,password,full_name,role,employee_category,department,schedule_id:newSchedId}=req.body;
+  if(!username||!password) return res.status(400).json({error:'Username and password are required'});
   const hash=await bcrypt.hash(password,10);
   const colors=['#3B82F6','#10B981','#F59E0B','#8B5CF6','#EC4899','#06B6D4'];
   const color=colors[Math.floor(Math.random()*colors.length)];
-  const[r]=await pool.query('INSERT INTO users(username,email,password_hash,full_name,role,employee_category,department,avatar_color) VALUES(?,?,?,?,?,?,?,?)',
-    [username,email,hash,full_name||username,role||'member',employee_category||'office',department||'',color]);
+  const[r]=await pool.query('INSERT INTO users(username,email,password_hash,full_name,role,employee_category,department,avatar_color,schedule_id) VALUES(?,?,?,?,?,?,?,?,?)',
+    [username,email||'',hash,full_name||username,role||'member',employee_category||'office',department||'',color,newSchedId||null]);
   if(role==='supervisor') await pool.query('INSERT IGNORE INTO supervisor_permissions(user_id) VALUES(?)',[r.insertId]);
   res.json({id:r.insertId,username,email,full_name,role:role||'member',employee_category:employee_category||'office',department:department||'',avatar_color:color});
 }));
