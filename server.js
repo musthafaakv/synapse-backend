@@ -52,27 +52,42 @@ function timeHHMM(d){ // extract HH:MM from a Date object
   return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
 }
 function timeGte(a,b){ return a>=b; } // "a >= b" in HH:MM string compare
+function addMinutesToHHMM(hhmm, mins){
+  const [h,m]=hhmm.split(':').map(Number);
+  const total=(h*60+m+mins);
+  return String(Math.floor(total/60)%24).padStart(2,'0')+':'+String(total%60).padStart(2,'0');
+}
 function timeLte(a,b){ return a<=b; }
 function timeBetween(t,from,to){ return t>=from && t<=to; }
 
 // Returns {clock_in_status, flag, auto_approved, approved_clock_in}
-function evaluateClockIn(now, category){
+function evaluateClockIn(now, category, sched){
   const t = timeHHMM(now);
+  /* If user has a custom schedule, use it */
+  if(sched && sched.workStart){
+    const graceUntil = addMinutesToHHMM(sched.workStart, sched.graceMin||15);
+    const lateAfter  = addMinutesToHHMM(sched.workStart, sched.lateMin||30);
+    if(timeLte(t, graceUntil)){
+      return {clock_in_status:'approved', flag:'on_time', approved_clock_in:now};
+    }
+    if(timeLte(t, lateAfter)){
+      return {clock_in_status:'approved', flag:'late', approved_clock_in:now};
+    }
+    return {clock_in_status:'approved', flag:'late', approved_clock_in:now};
+  }
+  /* Legacy category-based rules */
   if(category==='office'){
     if(timeBetween(t, RULES.office.ci_auto_start, RULES.office.ci_auto_end)){
       return {clock_in_status:'approved', flag:'on_time', approved_clock_in:now};
     }
-    return {clock_in_status:'pending', flag: t<RULES.office.ci_auto_start?'early':'late'};
+    const flag = t>RULES.office.ci_auto_end?'late':'on_time';
+    return {clock_in_status:'approved', flag, approved_clock_in:now};
   }
   if(category==='field'){
-    if(timeLte(t, RULES.field.ci_late_until)){
-      return {clock_in_status:'approved', flag:'on_time', approved_clock_in:now};
-    }
-    // After 09:35 → late, needs approval
-    return {clock_in_status:'pending', flag:'late'};
+    const flag = timeLte(t, RULES.field.ci_late_until)?'on_time':'late';
+    return {clock_in_status:'approved', flag, approved_clock_in:now};
   }
-  // unknown category → pending
-  return {clock_in_status:'pending', flag:'on_time'};
+  return {clock_in_status:'approved', flag:'on_time', approved_clock_in:now};
 }
 
 function evaluateClockOut(now, category){
@@ -342,11 +357,11 @@ async function setupDatabase(){
       work_end TIME NOT NULL DEFAULT '18:00:00',
       grace_minutes INT DEFAULT 15,
       late_after_minutes INT DEFAULT 30,
-      approved_start TIME DEFAULT NULL,
-      approved_end TIME DEFAULT NULL,
+      early_checkout_minutes INT DEFAULT 15,
       is_default TINYINT(1) DEFAULT 0,
       is_active TINYINT(1) DEFAULT 1,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+    await c.query('ALTER TABLE attendance_categories ADD COLUMN early_checkout_minutes INT DEFAULT 15').catch(()=>{});
 
     /* Seed default category if empty */
     const[catRows]=await c.query('SELECT COUNT(*) as cnt FROM attendance_categories');
@@ -399,6 +414,7 @@ async function setupDatabase(){
     /* Migrations */
     await c.query('ALTER TABLE attendance ADD COLUMN category_id INT DEFAULT NULL').catch(()=>{});
     await c.query('ALTER TABLE attendance ADD COLUMN notes TEXT DEFAULT NULL').catch(()=>{});
+    await c.query('ALTER TABLE users ADD COLUMN schedule_id INT DEFAULT NULL').catch(()=>{});
     await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN employee_category ENUM('office','field') DEFAULT 'office'`).catch(()=>{});
     await c.query(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE`).catch(()=>{});
@@ -520,7 +536,7 @@ app.post('/api/users', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 app.put('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
-  const{email,full_name,role,is_active,password,permissions,employee_category,department}=req.body;
+  const{email,full_name,role,is_active,password,permissions,employee_category,department,schedule_id}=req.body;
   const uid=parseInt(req.params.id);
   const u=[],v=[];
   if(email!==undefined){u.push('email=?');v.push(email);}
@@ -536,6 +552,7 @@ app.put('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
   if(req.body.must_change_password===false){u.push('must_change_password=?');v.push(0);}
   if(employee_category!==undefined){u.push('employee_category=?');v.push(employee_category);}
   if(department!==undefined){u.push('department=?');v.push(department);}
+  if(schedule_id!==undefined){u.push('schedule_id=?');v.push(schedule_id||null);}
   if(u.length){v.push(uid);await pool.query(`UPDATE users SET ${u.join(',')} WHERE id=?`,v);}
   if(role==='supervisor'||permissions){
     const[ex]=await pool.query('SELECT user_id FROM supervisor_permissions WHERE user_id=?',[uid]);
@@ -788,15 +805,22 @@ app.post('/api/attendance/clock-in', auth, wrap(async(req,res)=>{
   const userId=req.user.id,now=new Date(),today=localDate(now);
 
   // Fetch user's category
-  const[urows]=await pool.query('SELECT employee_category FROM users WHERE id=?',[userId]);
-  const category=(urows[0]?.employee_category)||'office';
+  const[urows]=await pool.query('SELECT u.employee_category,u.schedule_id,ac.work_start,ac.work_end,ac.grace_minutes,ac.late_after_minutes,ac.early_checkout_minutes FROM users u LEFT JOIN attendance_categories ac ON u.schedule_id=ac.id WHERE u.id=?',[userId]);
+  const urow=urows[0]||{};
+  const category=urow.employee_category||'office';
+  /* Use schedule settings if assigned */
+  const schedWorkStart=urow.work_start?(urow.work_start+'').slice(0,5):null;
+  const schedWorkEnd=urow.work_end?(urow.work_end+'').slice(0,5):null;
+  const schedGrace=urow.grace_minutes!=null?parseInt(urow.grace_minutes):null;
+  const schedLate=urow.late_after_minutes!=null?parseInt(urow.late_after_minutes):null;
 
   const[hols]=await pool.query('SELECT * FROM holidays WHERE holiday_date=?',[today]);
   if(hols.length) return res.status(400).json({error:`Today is a holiday: ${hols[0].name}`});
   const[ex]=await pool.query('SELECT * FROM attendance WHERE user_id=? AND work_date=?',[userId,today]);
   if(ex.length) return res.status(400).json({error:'Already clocked in today'});
 
-  const eval_=evaluateClockIn(now,category);
+  const sched=schedWorkStart?{workStart:schedWorkStart,workEnd:schedWorkEnd,graceMin:schedGrace,lateMin:schedLate}:null;
+  const eval_=evaluateClockIn(now,category,sched);
   const insertData={
     user_id:userId, work_date:today, clock_in:now,
     clock_in_status:eval_.clock_in_status,
@@ -911,9 +935,9 @@ app.get('/api/admin/attendance', auth, adminOrSupervisor, wrap(async(req,res)=>{
   const startDate=`${y}-${String(m).padStart(2,'0')}-01`,lastD=new Date(y,m,0).getDate();
   const endDate=`${y}-${String(m).padStart(2,'0')}-${String(lastD).padStart(2,'0')}`;
   await ensureSundaysHolidays(startDate,endDate);
-  let sql=`SELECT a.*,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,
+  let sql=`SELECT a.*,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,u.schedule_id,ac2.name as schedule_name,ac2.work_start as sched_start,ac2.work_end as sched_end,
     ab.full_name as approver_name,ab.username as approver_username,ab.avatar_color as approver_avatar_color,ab.role as approver_role
-    FROM attendance a JOIN users u ON a.user_id=u.id LEFT JOIN users ab ON a.approved_by=ab.id
+    FROM attendance a JOIN users u ON a.user_id=u.id LEFT JOIN users ab ON a.approved_by=ab.id LEFT JOIN attendance_categories ac2 ON u.schedule_id=ac2.id
     WHERE a.work_date BETWEEN ? AND ?`;
   const params=[startDate,endDate];
   if(user_id){sql+=' AND a.user_id=?';params.push(user_id);}
@@ -1671,11 +1695,48 @@ app.delete('/api/admin/att-categories/:id', auth, adminOnly, wrap(async(req,res)
 }));
 
 /* Override check-in/out time for a specific attendance record */
+/* Admin manual add attendance record */
+app.post('/api/admin/attendance/manual', auth, adminOnly, wrap(async(req,res)=>{
+  const{user_id,work_date,clock_in,clock_out,notes}=req.body;
+  if(!user_id||!work_date) return res.status(400).json({error:'user_id and work_date required'});
+  const ci=clock_in?new Date(`${work_date}T${clock_in}:00`):null;
+  const co=clock_out?new Date(`${work_date}T${clock_out}:00`):null;
+  /* Determine if late based on user schedule */
+  const[[ur]]=await pool.query('SELECT u.schedule_id,ac.work_start,ac.grace_minutes,ac.late_after_minutes FROM users u LEFT JOIN attendance_categories ac ON u.schedule_id=ac.id WHERE u.id=?',[user_id]);
+  let flag='on_time';
+  if(ci&&ur&&ur.work_start){
+    const t=`${String(ci.getHours()).padStart(2,'0')}:${String(ci.getMinutes()).padStart(2,'0')}`;
+    const lateAfter=addMinutesToHHMM((ur.work_start+'').slice(0,5),parseInt(ur.late_after_minutes||30));
+    if(t>lateAfter) flag='late';
+    else if(t>(ur.work_start+'').slice(0,5)) flag='late';
+  }
+  await pool.query(`INSERT INTO attendance(user_id,work_date,clock_in,clock_out,clock_in_status,clock_in_flag,approved_clock_in,approved_clock_out,admin_note)
+    VALUES(?,?,?,?,'approved',?,?,?,?)
+    ON DUPLICATE KEY UPDATE clock_in=VALUES(clock_in),clock_out=VALUES(clock_out),clock_in_flag=VALUES(clock_in_flag),approved_clock_in=VALUES(approved_clock_in),approved_clock_out=VALUES(approved_clock_out),admin_note=VALUES(admin_note)`,
+    [user_id,work_date,ci,co,flag,ci,co,notes||null]);
+  res.json({success:true});
+}));
+
 app.put('/api/admin/attendance/:id/override-time', auth, adminOnly, wrap(async(req,res)=>{
-  const{clock_in,clock_out,category_id,notes}=req.body;
+  const{clock_in,clock_out,category_id,notes,work_date}=req.body;
+  /* Recalculate late flag if clock_in changes */
+  let flagUpdate='';
+  if(clock_in){
+    const[[rec]]=await pool.query('SELECT a.work_date,u.schedule_id,ac.work_start,ac.late_after_minutes FROM attendance a JOIN users u ON a.user_id=u.id LEFT JOIN attendance_categories ac ON u.schedule_id=ac.id WHERE a.id=?',[req.params.id]);
+    if(rec&&rec.work_start){
+      const wd=rec.work_date.toISOString?rec.work_date.toISOString().split('T')[0]:(rec.work_date+'').split('T')[0];
+      const ci=new Date(`${wd}T${clock_in}`);
+      const t=`${String(ci.getHours()).padStart(2,'0')}:${String(ci.getMinutes()).padStart(2,'0')}`;
+      const lateAfter=addMinutesToHHMM((rec.work_start+'').slice(0,5),parseInt(rec.late_after_minutes||30));
+      const flag=t>lateAfter?'late':'on_time';
+      flagUpdate=`,clock_in_flag='${flag}'`;
+    }
+  }
+  const ciVal=clock_in?`${(work_date||new Date().toISOString().split('T')[0])}T${clock_in}`:null;
+  const coVal=clock_out?`${(work_date||new Date().toISOString().split('T')[0])}T${clock_out}`:null;
   await pool.query(
-    'UPDATE attendance SET clock_in=COALESCE(?,clock_in),clock_out=COALESCE(?,clock_out),category_id=COALESCE(?,category_id),notes=COALESCE(?,notes),updated_at=NOW() WHERE id=?',
-    [clock_in||null,clock_out||null,category_id||null,notes||null,req.params.id]);
+    `UPDATE attendance SET clock_in=COALESCE(?,clock_in),clock_out=COALESCE(?,clock_out),approved_clock_in=COALESCE(?,approved_clock_in),approved_clock_out=COALESCE(?,approved_clock_out),admin_note=COALESCE(?,admin_note)${flagUpdate},updated_at=NOW() WHERE id=?`,
+    [ciVal,coVal,ciVal,coVal,notes||null,req.params.id]);
   res.json({success:true});
 }));
 
