@@ -928,6 +928,70 @@ app.get('/api/attendance/my', auth, wrap(async(req,res)=>{
   res.json({report,stats,year:y,month:m});
 }));
 
+/* Admin: Per-user daily report (staff report grid) */
+app.get('/api/admin/attendance/report', auth, adminOrSupervisor, wrap(async(req,res)=>{
+  if(req.user.role==='supervisor'&&!req.user.permissions?.can_view_all_attendance) return res.status(403).json({error:'Permission denied'});
+  const{year,month}=req.query;
+  const y=parseInt(year)||new Date().getFullYear(),m=parseInt(month)||new Date().getMonth()+1;
+  const startDate=`${y}-${String(m).padStart(2,'0')}-01`,lastD=new Date(y,m,0).getDate();
+  const endDate=`${y}-${String(m).padStart(2,'0')}-${String(lastD).padStart(2,'0')}`;
+  await ensureSundaysHolidays(startDate,endDate);
+
+  /* Only ACTIVE non-admin users */
+  const[users]=await pool.query(
+    `SELECT u.id,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,u.schedule_id,
+      ac.name as schedule_name,ac.work_start,ac.work_end
+     FROM users u LEFT JOIN attendance_categories ac ON u.schedule_id=ac.id
+     WHERE u.is_active=1 AND u.role IN('member','supervisor')
+     ORDER BY u.full_name`);
+
+  const[records]=await pool.query(
+    `SELECT * FROM attendance
+     WHERE work_date BETWEEN ? AND ?
+     AND user_id IN(SELECT id FROM users WHERE is_active=1 AND role IN('member','supervisor'))
+     ORDER BY work_date`,[startDate,endDate]);
+
+  const[holidays]=await pool.query(
+    'SELECT * FROM holidays WHERE holiday_date BETWEEN ? AND ? ORDER BY holiday_date',
+    [startDate,endDate]);
+
+  const today=localDate(new Date());
+  const holidayMap={};
+  holidays.forEach(h=>{
+    const hd=h.holiday_date instanceof Date?localDate(h.holiday_date):(h.holiday_date+'').split('T')[0];
+    holidayMap[hd]=h;
+  });
+
+  const userReports=users.map(u=>{
+    const userRecs={};
+    records.filter(r=>r.user_id===u.id).forEach(r=>{
+      const wd=r.work_date instanceof Date?localDate(r.work_date):(r.work_date+'').split('T')[0];
+      userRecs[wd]=r;
+    });
+    const days=[];
+    for(let d=1;d<=lastD;d++){
+      const ds=`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      const dow=new Date(ds+'T12:00:00').getDay();
+      if(ds>today){days.push({date:ds,day_of_week:dow,type:'future'});continue;}
+      if(holidayMap[ds]){
+        const h=holidayMap[ds];
+        days.push({date:ds,day_of_week:dow,type:'holiday',holiday_name:h.name,holiday_type:h.type,name:h.name});
+        continue;
+      }
+      if(userRecs[ds]){
+        days.push({date:ds,day_of_week:dow,type:'attendance',...userRecs[ds],
+          clock_in:userRecs[ds].clock_in,clock_out:userRecs[ds].clock_out,
+          approved_clock_in:userRecs[ds].approved_clock_in,approved_clock_out:userRecs[ds].approved_clock_out});
+        continue;
+      }
+      days.push({date:ds,day_of_week:dow,type:'absent'});
+    }
+    return{user:u,days};
+  });
+
+  res.json({userReports,year:y,month:m});
+}));
+
 /* Admin: all attendance records */
 app.get('/api/admin/attendance', auth, adminOrSupervisor, wrap(async(req,res)=>{
   if(req.user.role==='supervisor'&&!req.user.permissions?.can_view_all_attendance) return res.status(403).json({error:'Permission denied'});
@@ -939,7 +1003,7 @@ app.get('/api/admin/attendance', auth, adminOrSupervisor, wrap(async(req,res)=>{
   let sql=`SELECT a.*,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,u.schedule_id,ac2.name as schedule_name,ac2.work_start as sched_start,ac2.work_end as sched_end,
     ab.full_name as approver_name,ab.username as approver_username,ab.avatar_color as approver_avatar_color,ab.role as approver_role
     FROM attendance a JOIN users u ON a.user_id=u.id LEFT JOIN users ab ON a.approved_by=ab.id LEFT JOIN attendance_categories ac2 ON u.schedule_id=ac2.id
-    WHERE a.work_date BETWEEN ? AND ?`;
+    WHERE u.is_active=1 AND a.work_date BETWEEN ? AND ?`;
   const params=[startDate,endDate];
   if(user_id){sql+=' AND a.user_id=?';params.push(user_id);}
   if(category){sql+=' AND u.employee_category=?';params.push(category);}
@@ -1050,7 +1114,8 @@ app.get('/api/admin/attendance/stats', auth, adminOrSupervisor, wrap(async(req,r
 
   // Per employee with category
   const[perUser]=await pool.query(`SELECT
-    u.id,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,
+    u.id,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,u.schedule_id,
+    ac.name as schedule_name,ac.work_start,ac.work_end,
     COUNT(a.id) as check_ins,
     COALESCE(SUM(a.clock_in_status='approved'),0) as approved,
     COALESCE(SUM(a.clock_in_status='pending'),0) as pending,
@@ -1058,9 +1123,11 @@ app.get('/api/admin/attendance/stats', auth, adminOrSupervisor, wrap(async(req,r
     COALESCE(SUM(a.clock_in_flag='late'),0) as late,
     COALESCE(SUM(a.clock_out_flag='early'),0) as early_out
     FROM users u
+    LEFT JOIN attendance_categories ac ON u.schedule_id=ac.id
     LEFT JOIN attendance a ON u.id=a.user_id AND a.work_date BETWEEN ? AND ?
     WHERE u.is_active=1 AND u.role IN('member','supervisor')
-    GROUP BY u.id ORDER BY u.employee_category,u.full_name`,[startDate,endDate]);
+    GROUP BY u.id,u.full_name,u.username,u.avatar_color,u.employee_category,u.department,u.schedule_id,ac.name,ac.work_start,ac.work_end
+    ORDER BY u.full_name`,[startDate,endDate]);
 
   // Daily breakdown
   const[daily]=await pool.query(`SELECT
@@ -1081,22 +1148,7 @@ app.get('/api/admin/attendance/stats', auth, adminOrSupervisor, wrap(async(req,r
     if(ds<=today&&!holidayDates.has(ds))workingDays++;
   }
 
-  // Category totals
-  const[[office]]=await pool.query(`SELECT COUNT(DISTINCT u.id) as total_users,
-    COALESCE(SUM(a.clock_in_status='approved'),0) as approved,
-    COALESCE(SUM(a.clock_in_status='pending'),0) as pending,
-    COALESCE(SUM(a.clock_in_flag='late'),0) as late
-    FROM users u LEFT JOIN attendance a ON u.id=a.user_id AND a.work_date BETWEEN ? AND ?
-    WHERE u.is_active=1 AND u.employee_category='office' AND u.role IN('member','supervisor')`,[startDate,endDate]);
-  const[[field]]=await pool.query(`SELECT COUNT(DISTINCT u.id) as total_users,
-    COALESCE(SUM(a.clock_in_status='approved'),0) as approved,
-    COALESCE(SUM(a.clock_in_status='pending'),0) as pending,
-    COALESCE(SUM(a.clock_in_flag='late'),0) as late,
-    COALESCE(SUM(a.clock_out_flag='early'),0) as early_out
-    FROM users u LEFT JOIN attendance a ON u.id=a.user_id AND a.work_date BETWEEN ? AND ?
-    WHERE u.is_active=1 AND u.employee_category='field' AND u.role IN('member','supervisor')`,[startDate,endDate]);
-
-  res.json({overall,perUser,daily,holidays,workingDays,office,field,year:y,month:m});
+  res.json({overall,perUser,daily,holidays,workingDays,year:y,month:m});
 }));
 
 app.post('/api/admin/holidays', auth, adminOrSupervisor, wrap(async(req,res)=>{
