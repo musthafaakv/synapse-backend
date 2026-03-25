@@ -550,10 +550,27 @@ async function setupDatabase(){
       total_cost DECIMAL(14,2) DEFAULT 0,
       total_profit DECIMAL(14,2) DEFAULT 0,
       currency VARCHAR(10) DEFAULT 'AED',
+      version_number VARCHAR(50) DEFAULT NULL,
+      customer_trn VARCHAR(50) DEFAULT NULL,
+      contact_person VARCHAR(255) DEFAULT NULL,
       created_by INT DEFAULT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
+
+    /* Migrate cpq_quotes table */
+    const cpqQCols=await c.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='cpq_quotes'");
+    const existCPQQ=new Set((cpqQCols[0]||[]).map(r=>r.COLUMN_NAME));
+    const cpqQAlters=[
+      ['version_number','VARCHAR(50) DEFAULT NULL'],
+      ['customer_trn','VARCHAR(50) DEFAULT NULL'],
+      ['contact_person','VARCHAR(255) DEFAULT NULL'],
+    ];
+    for(const[col,def] of cpqQAlters){
+      if(!existCPQQ.has(col)){
+        await c.query('ALTER TABLE cpq_quotes ADD COLUMN '+col+' '+def).catch(e=>console.log('migrate cpq_quotes '+col+':',e.message));
+      }
+    }
 
     await c.query(`CREATE TABLE IF NOT EXISTS cpq_quote_items(
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1859,8 +1876,9 @@ app.put('/api/admin/attendance/:id/override-time', auth, adminOnly, wrap(async(r
 /* Quote number generator */
 async function nextCPQNumber(){
   const y=new Date().getFullYear();
-  const[[row]]=await pool.query("SELECT MAX(CAST(SUBSTRING_INDEX(quote_number,'/',-1) AS UNSIGNED)) as mx FROM cpq_quotes WHERE quote_number LIKE ?",['CPQ/CCT/'+y+'-%']);
-  return `CPQ/CCT/${y}-${String((row?.mx||0)+1).padStart(3,'0')}`;
+  const[[row]]=await pool.query("SELECT MAX(CAST(SUBSTRING_INDEX(quote_number,'-',-1) AS UNSIGNED)) as mx FROM cpq_quotes WHERE quote_number LIKE ?",['QT/CCT/'+y+'-%']);
+  const next=Math.max((row?.mx||0)+1,501);
+  return `QT/CCT/${y}-${next}`;
 }
 
 /* Products */
@@ -1942,11 +1960,11 @@ app.get('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
   res.json({...q,items});
 }));
 app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
-  const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,items}=req.body;
-  const qnum=await nextCPQNumber();
+  const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,contact_person,items,quote_number_override}=req.body;
+  const qnum=quote_number_override||await nextCPQNumber();
   const[r]=await pool.query(
-    'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-    [qnum,quote_date||localDate(new Date()),valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',req.user.id]);
+    'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,contact_person,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [qnum,quote_date||localDate(new Date()),valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',version_number||null,customer_trn||null,contact_person||null,req.user.id]);
   const qid=r.insertId;
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
@@ -1958,10 +1976,10 @@ app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
   res.json({success:true,id:qid,quote_number:qnum});
 }));
 app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
-  const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,items}=req.body;
+  const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,contact_person,items,quote_number_override}=req.body;
   await pool.query(
-    'UPDATE cpq_quotes SET quote_date=?,valid_till=?,status=?,customer_name=?,customer_email=?,customer_phone=?,customer_address=?,subject=?,notes=?,discount_pct=?,subtotal=?,discount_amount=?,total=?,total_cost=?,total_profit=?,currency=?,updated_at=NOW() WHERE id=?',
-    [quote_date,valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',req.params.id]);
+    'UPDATE cpq_quotes SET quote_date=?,valid_till=?,status=?,customer_name=?,customer_email=?,customer_phone=?,customer_address=?,subject=?,notes=?,discount_pct=?,subtotal=?,discount_amount=?,total=?,total_cost=?,total_profit=?,currency=?,version_number=?,customer_trn=?,contact_person=?,updated_at=NOW() WHERE id=?',
+    [quote_date,valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',version_number||null,customer_trn||null,contact_person||null,req.params.id]);
   if(items){
     await pool.query('DELETE FROM cpq_quote_items WHERE quote_id=?',[req.params.id]);
     for(let i=0;i<items.length;i++){
