@@ -456,6 +456,7 @@ async function setupDatabase(){
     if(!existCPQItems.has('sku')){
       await c.query("ALTER TABLE cpq_quote_items ADD COLUMN sku VARCHAR(100) DEFAULT NULL AFTER product_name").catch(e=>console.log('migrate cpq_quote_items sku:',e.message));
     }
+    await c.query('CREATE TABLE IF NOT EXISTS cpq_quote_logs(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(quote_id),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(changed_by) REFERENCES users(id) ON DELETE SET NULL)');
     await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq(
       id INT AUTO_INCREMENT PRIMARY KEY,
       boq_number VARCHAR(50) NOT NULL UNIQUE,
@@ -1980,6 +1981,9 @@ app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
     'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,customer_city,customer_country,contact_person,vat_rate,vat_amount,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     [qnum,quote_date||localDate(new Date()),valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',version_number||null,customer_trn||null,customer_city||null,customer_country||null,contact_person||null,vat_rate||0,vat_amount||0,req.user.id]);
   const qid=r.insertId;
+  /* Log creation */
+  await pool.query('INSERT INTO cpq_quote_logs(quote_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
+    [qid,'created',req.user.id,req.user.full_name||req.user.username,'Quote created']).catch(()=>{});
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
       const it=items[i];
@@ -1994,6 +1998,17 @@ app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
   await pool.query(
     'UPDATE cpq_quotes SET quote_date=?,valid_till=?,status=?,customer_name=?,customer_email=?,customer_phone=?,customer_address=?,subject=?,notes=?,discount_pct=?,subtotal=?,discount_amount=?,total=?,total_cost=?,total_profit=?,currency=?,version_number=?,customer_trn=?,customer_city=?,customer_country=?,contact_person=?,vat_rate=?,vat_amount=?,updated_at=NOW() WHERE id=?',
     [quote_date,valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',version_number||null,customer_trn||null,customer_city||null,customer_country||null,contact_person||null,vat_rate||0,vat_amount||0,req.params.id]);
+  /* Log update */
+  const _logChanges=(function(){
+    const parts=[];
+    if(customer_name) parts.push('Customer: '+customer_name);
+    if(subject) parts.push('Subject: '+subject);
+    if(status) parts.push('Status→'+status);
+    if(total) parts.push('Total: '+total);
+    return parts.join(' | ')||'Quote updated';
+  })();
+  await pool.query('INSERT INTO cpq_quote_logs(quote_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
+    [req.params.id,'updated',req.user.id,req.user.full_name||req.user.username,_logChanges]).catch(()=>{});
   if(items){
     await pool.query('DELETE FROM cpq_quote_items WHERE quote_id=?',[req.params.id]);
     for(let i=0;i<items.length;i++){
@@ -2114,6 +2129,14 @@ app.post('/api/cpq/boq/:id/convert', auth, wrap(async(req,res)=>{
   }
   await pool.query('UPDATE cpq_boq SET status=?,converted_quote_id=? WHERE id=?',['converted',qid,req.params.id]);
   res.json({success:true,quote_id:qid,quote_number:qnum});
+}));
+
+/* CPQ Quote Logs */
+app.get('/api/cpq/quotes/:id/logs', auth, adminOnly, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT l.*,u.username FROM cpq_quote_logs l LEFT JOIN users u ON l.changed_by=u.id WHERE l.quote_id=? ORDER BY l.created_at DESC',
+    [req.params.id]);
+  res.json(rows);
 }));
 
 /* ══════════════════════════════════════
