@@ -1991,7 +1991,7 @@ app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
     for(let i=0;i<items.length;i++){
       const it=items[i];
       await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,sku,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-        [req.params.id,i,it.product_id||null,it.product_name||'',it.description||null,it.category||null,it.supplier_id||null,it.supplier_name||null,it.qty||1,it.unit||'pcs',it.cost||0,it.currency||'AED',it.markup_pct||0,it.selling_price||0,it.line_total||0,it.line_profit||0]);
+        [req.params.id,i,it.product_id||null,it.product_name||'',it.sku||null,it.description||null,it.category||null,it.supplier_id||null,it.supplier_name||null,it.qty||1,it.unit||'pcs',it.cost||0,it.currency||'AED',it.markup_pct||0,it.selling_price||0,it.line_total||0,it.line_profit||0]);
     }
   }
   res.json({success:true});
