@@ -450,6 +450,12 @@ async function setupDatabase(){
     /* ── CPQ Tables ── */
     /* CPQ T&C Templates (shared with DN) - already exists as dn_tc_templates */
     /* BOQ Tables */
+    /* Migrate cpq_quote_items - add sku */
+    const cpqItemCols=await c.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='cpq_quote_items'");
+    const existCPQItems=new Set((cpqItemCols[0]||[]).map(r=>r.COLUMN_NAME));
+    if(!existCPQItems.has('sku')){
+      await c.query("ALTER TABLE cpq_quote_items ADD COLUMN sku VARCHAR(100) DEFAULT NULL AFTER product_name").catch(e=>console.log('migrate cpq_quote_items sku:',e.message));
+    }
     await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq(
       id INT AUTO_INCREMENT PRIMARY KEY,
       boq_number VARCHAR(50) NOT NULL UNIQUE,
@@ -578,6 +584,7 @@ async function setupDatabase(){
       sort_order INT DEFAULT 0,
       product_id INT DEFAULT NULL,
       product_name VARCHAR(255) NOT NULL,
+      sku VARCHAR(100) DEFAULT NULL,
       description TEXT DEFAULT NULL,
       category VARCHAR(100) DEFAULT NULL,
       supplier_id INT DEFAULT NULL,
@@ -1969,8 +1976,8 @@ app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
       const it=items[i];
-      await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-        [qid,i,it.product_id||null,it.product_name||'',it.description||null,it.category||null,it.supplier_id||null,it.supplier_name||null,it.qty||1,it.unit||'pcs',it.cost||0,it.currency||'AED',it.markup_pct||0,it.selling_price||0,it.line_total||0,it.line_profit||0]);
+      await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,sku,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [qid,i,it.product_id||null,it.product_name||'',it.sku||null,it.description||null,it.category||null,it.supplier_id||null,it.supplier_name||null,it.qty||1,it.unit||'pcs',it.cost||0,it.currency||'AED',it.markup_pct||0,it.selling_price||0,it.line_total||0,it.line_profit||0]);
     }
   }
   res.json({success:true,id:qid,quote_number:qnum});
@@ -1984,7 +1991,7 @@ app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
     await pool.query('DELETE FROM cpq_quote_items WHERE quote_id=?',[req.params.id]);
     for(let i=0;i<items.length;i++){
       const it=items[i];
-      await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,sku,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [req.params.id,i,it.product_id||null,it.product_name||'',it.description||null,it.category||null,it.supplier_id||null,it.supplier_name||null,it.qty||1,it.unit||'pcs',it.cost||0,it.currency||'AED',it.markup_pct||0,it.selling_price||0,it.line_total||0,it.line_profit||0]);
     }
   }
@@ -2005,8 +2012,8 @@ app.post('/api/cpq/quotes/:id/duplicate', auth, wrap(async(req,res)=>{
     [qnum,localDate(new Date()),orig.valid_till,'draft',orig.customer_name,orig.customer_email,orig.customer_phone,orig.customer_address,orig.subject,orig.notes,orig.discount_pct,orig.subtotal,orig.discount_amount,orig.total,orig.total_cost,orig.total_profit,orig.currency,req.user.id]);
   const qid=r.insertId;
   for(const it of origItems){
-    await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-      [qid,it.sort_order,it.product_id,it.product_name,it.description,it.category,it.supplier_id,it.supplier_name,it.qty,it.unit,it.cost,it.currency,it.markup_pct,it.selling_price,it.line_total,it.line_profit]);
+    await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,sku,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      [qid,it.sort_order,it.product_id,it.product_name,it.sku||null,it.description,it.category,it.supplier_id,it.supplier_name,it.qty,it.unit,it.cost,it.currency,it.markup_pct,it.selling_price,it.line_total,it.line_profit]);
   }
   res.json({success:true,id:qid,quote_number:qnum});
 }));
