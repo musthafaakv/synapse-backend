@@ -295,16 +295,25 @@ async function setupDatabase(){
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
 
-    /* Migrate existing clients table columns */
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS country VARCHAR(100) DEFAULT 'United Arab Emirates'").catch(()=>{});
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS city VARCHAR(100) DEFAULT NULL").catch(()=>{});
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS client_type ENUM('individual','company') DEFAULT 'company'").catch(()=>{});
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS trn_not_registered TINYINT(1) DEFAULT 0").catch(()=>{});
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS additional_details TEXT DEFAULT NULL").catch(()=>{});
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS contact_person VARCHAR(255) DEFAULT NULL").catch(()=>{});
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS contact_mobile VARCHAR(50) DEFAULT NULL").catch(()=>{});
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS created_by INT DEFAULT NULL").catch(()=>{});
-    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP").catch(()=>{});
+    /* Migrate existing clients table — safe column-by-column checks */
+    const clientCols = await c.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='clients'");
+    const existingCols = new Set((clientCols[0]||[]).map(r=>r.COLUMN_NAME));
+    const clientAlters = [
+      ["country",   "VARCHAR(100) DEFAULT 'United Arab Emirates'"],
+      ["city",       "VARCHAR(100) DEFAULT NULL"],
+      ["client_type","ENUM('individual','company') DEFAULT 'company'"],
+      ["trn_not_registered","TINYINT(1) DEFAULT 0"],
+      ["additional_details","TEXT DEFAULT NULL"],
+      ["contact_person","VARCHAR(255) DEFAULT NULL"],
+      ["contact_mobile","VARCHAR(50) DEFAULT NULL"],
+      ["created_by","INT DEFAULT NULL"],
+      ["updated_at","TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"],
+    ];
+    for(const [col,def] of clientAlters){
+      if(!existingCols.has(col)){
+        await c.query("ALTER TABLE clients ADD COLUMN "+col+" "+def).catch(e=>console.log('migrate clients col '+col+':',e.message));
+      }
+    }
 
     await c.query(`CREATE TABLE IF NOT EXISTS quotations(
       id INT AUTO_INCREMENT PRIMARY KEY,
