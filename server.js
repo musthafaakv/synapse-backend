@@ -1783,17 +1783,6 @@ app.delete('/api/clients/:id', auth, wrap(async(req,res)=>{
   res.json({success:true});
 }));
 
-/* Get single client */
-app.get('/api/clients/:id', auth, wrap(async(req,res)=>{
-  const[[c]]=await pool.query('SELECT * FROM clients WHERE id=?',[req.params.id]);
-  if(!c) return res.status(404).json({error:'Not found'});
-  res.json(c);
-}));
-app.delete('/api/clients/:id', auth, adminOnly, wrap(async(req,res)=>{
-  await pool.query('UPDATE clients SET is_active=0 WHERE id=?',[req.params.id]);
-  res.json({success:true});
-}));
-
 /* ══════════════════════════════════════
    ATTENDANCE CATEGORIES
 ══════════════════════════════════════ */
@@ -2018,8 +2007,8 @@ app.post('/api/cpq/quotes/:id/duplicate', auth, wrap(async(req,res)=>{
   const[origItems]=await pool.query('SELECT * FROM cpq_quote_items WHERE quote_id=? ORDER BY sort_order',[req.params.id]);
   const qnum=await nextCPQNumber();
   const[r]=await pool.query(
-    'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-    [qnum,localDate(new Date()),orig.valid_till,'draft',orig.customer_name,orig.customer_email,orig.customer_phone,orig.customer_address,orig.subject,orig.notes,orig.discount_pct,orig.subtotal,orig.discount_amount,orig.total,orig.total_cost,orig.total_profit,orig.currency,req.user.id]);
+    'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,contact_person,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [qnum,localDate(new Date()),orig.valid_till,'draft',orig.customer_name,orig.customer_email,orig.customer_phone,orig.customer_address,orig.subject,orig.notes,orig.discount_pct,orig.subtotal,orig.discount_amount,orig.total,orig.total_cost,orig.total_profit,orig.currency,orig.version_number||null,orig.customer_trn||null,orig.contact_person||null,req.user.id]);
   const qid=r.insertId;
   for(const it of origItems){
     await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,sku,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
