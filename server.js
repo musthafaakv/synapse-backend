@@ -1982,8 +1982,12 @@ app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
     [qnum,quote_date||localDate(new Date()),valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',version_number||null,customer_trn||null,customer_city||null,customer_country||null,contact_person||null,vat_rate||0,vat_amount||0,req.user.id]);
   const qid=r.insertId;
   /* Log creation */
-  await pool.query('INSERT INTO cpq_quote_logs(quote_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
-    [qid,'created',req.user.id,req.user.full_name||req.user.username,'Quote created']).catch(()=>{});
+  /* Log creation */
+  try{
+    const createDiffs=[{field:'Quote Number',old:'—',new:qnum},{field:'Customer',old:'—',new:customer_name||'—'},{field:'Status',old:'—',new:status||'draft'},{field:'Total',old:'—',new:String(total||0)}];
+    await pool.query('INSERT INTO cpq_quote_logs(quote_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
+      [qid,'created',req.user.id,req.user.full_name||req.user.username,JSON.stringify(createDiffs)]);
+  }catch(le){console.error('Log create error:',le.message);}
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
       const it=items[i];
@@ -1998,17 +2002,51 @@ app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
   await pool.query(
     'UPDATE cpq_quotes SET quote_date=?,valid_till=?,status=?,customer_name=?,customer_email=?,customer_phone=?,customer_address=?,subject=?,notes=?,discount_pct=?,subtotal=?,discount_amount=?,total=?,total_cost=?,total_profit=?,currency=?,version_number=?,customer_trn=?,customer_city=?,customer_country=?,contact_person=?,vat_rate=?,vat_amount=?,updated_at=NOW() WHERE id=?',
     [quote_date,valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',version_number||null,customer_trn||null,customer_city||null,customer_country||null,contact_person||null,vat_rate||0,vat_amount||0,req.params.id]);
-  /* Log update */
-  const _logChanges=(function(){
-    const parts=[];
-    if(customer_name) parts.push('Customer: '+customer_name);
-    if(subject) parts.push('Subject: '+subject);
-    if(status) parts.push('Status→'+status);
-    if(total) parts.push('Total: '+total);
-    return parts.join(' | ')||'Quote updated';
-  })();
-  await pool.query('INSERT INTO cpq_quote_logs(quote_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
-    [req.params.id,'updated',req.user.id,req.user.full_name||req.user.username,_logChanges]).catch(()=>{});
+  /* Log update — full diff */
+  try{
+    const qid2=req.params.id;
+    const[[oldQ]]=await pool.query('SELECT * FROM cpq_quotes WHERE id=?',[qid2]);
+    const[oldItems]=await pool.query('SELECT * FROM cpq_quote_items WHERE quote_id=? ORDER BY sort_order',  [qid2]);
+    const diffs=[];
+    // Quote-level fields
+    const qFields=[
+      ['customer_name','Customer',null],
+      ['customer_trn','VAT/TRN',null],
+      ['subject','Subject',null],
+      ['status','Status',null],
+      ['quote_date','Quote Date',null],
+      ['valid_till','Valid Till',null],
+      ['currency','Currency',null],
+      ['discount_pct','Discount %',null],
+      ['discount_amount','Discount Amt',null],
+      ['vat_rate','VAT %',null],
+      ['subtotal','Subtotal',null],
+      ['total','Total',null],
+      ['notes','Terms & Conditions',null],
+    ];
+    for(const[key,label] of qFields){
+      const ov=oldQ?String(oldQ[key]||''):''
+      const nv=String((key==='customer_name'?customer_name:key==='customer_trn'?customer_trn:key==='subject'?subject:key==='status'?status:key==='quote_date'?quote_date:key==='valid_till'?valid_till:key==='currency'?currency:key==='discount_pct'?discount_pct:key==='discount_amount'?discount_amount:key==='vat_rate'?vat_rate:key==='subtotal'?subtotal:key==='total'?total:key==='notes'?notes:null)||'');
+      if(ov!==nv) diffs.push({field:label,old:ov||'—',new:nv||'—'});
+    }
+    // Items diff
+    const newItems=items||[];
+    const maxLen=Math.max(oldItems.length,newItems.length);
+    for(let ii=0;ii<maxLen;ii++){
+      const oi=oldItems[ii];const ni=newItems[ii];
+      const rowLabel='Row '+(ii+1);
+      if(!oi&&ni){ diffs.push({field:rowLabel,'old':'—','new':'Added: '+(ni.product_name||'item')}); continue; }
+      if(oi&&!ni){ diffs.push({field:rowLabel,'old':oi.product_name||'item','new':'Removed'}); continue; }
+      const iFields=[['product_name','Product'],['sku','SKU'],['description','Description'],['qty','Qty'],['unit','Unit'],['cost','Cost'],['selling_price','Sell Price'],['line_total','Line Total'],['supplier_name','Supplier']];
+      for(const[ik,il] of iFields){
+        const oiv=String(oi[ik]||'');const niv=String(ni[ik]||'');
+        if(oiv!==niv) diffs.push({field:rowLabel+' '+il,'old':oiv||'—','new':niv||'—'});
+      }
+    }
+    const changesJSON=JSON.stringify(diffs.length?diffs:[{field:'Quote',old:'',new:'Updated (no field changes detected)'}]);
+    await pool.query('INSERT INTO cpq_quote_logs(quote_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
+      [qid2,'updated',req.user.id,req.user.full_name||req.user.username,changesJSON]);
+  }catch(logErr){console.error('Log error:',logErr.message);}
   if(items){
     await pool.query('DELETE FROM cpq_quote_items WHERE quote_id=?',[req.params.id]);
     for(let i=0;i<items.length;i++){
