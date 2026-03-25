@@ -456,7 +456,9 @@ async function setupDatabase(){
     if(!existCPQItems.has('sku')){
       await c.query("ALTER TABLE cpq_quote_items ADD COLUMN sku VARCHAR(100) DEFAULT NULL AFTER product_name").catch(e=>console.log('migrate cpq_quote_items sku:',e.message));
     }
-    await c.query('CREATE TABLE IF NOT EXISTS cpq_followups(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,quote_number VARCHAR(50),customer_name VARCHAR(255),amount DECIMAL(14,2) DEFAULT 0,currency VARCHAR(10) DEFAULT \'AED\',status ENUM(\'pending\',\'contacted\',\'interested\',\'not_interested\',\'closed\',\'no_answer\') DEFAULT \'pending\',comment TEXT DEFAULT NULL,followed_by INT DEFAULT NULL,followed_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(quote_id),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(followed_by) REFERENCES users(id) ON DELETE SET NULL)');
+    await c.query('CREATE TABLE IF NOT EXISTS cpq_followups(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,quote_number VARCHAR(50),customer_name VARCHAR(255),amount DECIMAL(14,2) DEFAULT 0,currency VARCHAR(10) DEFAULT \'AED\',status VARCHAR(50) DEFAULT \'draft\',next_followup_date DATE DEFAULT NULL,comment TEXT DEFAULT NULL,followed_by INT DEFAULT NULL,followed_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(quote_id),INDEX(next_followup_date),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(followed_by) REFERENCES users(id) ON DELETE SET NULL)');
+        /* cpq_followups column migrations */
+        await c.query("ALTER TABLE cpq_followups ADD COLUMN IF NOT EXISTS next_followup_date DATE DEFAULT NULL").catch(()=>{});
         await c.query('CREATE TABLE IF NOT EXISTS cpq_quote_logs(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(quote_id),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(changed_by) REFERENCES users(id) ON DELETE SET NULL)');
     await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq(
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -2206,7 +2208,9 @@ app.get('/api/cpq/followups', auth, wrap(async(req,res)=>{
   const params=[];
   if(quote_id){sql+=' AND f.quote_id=?';params.push(quote_id);}
   if(search){sql+=' AND (f.comment LIKE ? OR f.customer_name LIKE ? OR f.quote_number LIKE ? OR f.followed_by_name LIKE ?)';const s='%'+search+'%';params.push(s,s,s,s);}
-  sql+=sort==='asc'?' ORDER BY f.created_at ASC':' ORDER BY f.created_at DESC';
+  if(sort==='next') sql+=' ORDER BY f.next_followup_date IS NULL ASC, f.next_followup_date ASC';
+  else if(sort==='asc') sql+=' ORDER BY f.created_at ASC';
+  else sql+=' ORDER BY f.created_at DESC';
   const[rows]=await pool.query(sql,params);
   res.json(rows);
 }));
@@ -2221,20 +2225,34 @@ app.get('/api/cpq/followups/quote/:qid', auth, wrap(async(req,res)=>{
 
 /* POST create follow-up */
 app.post('/api/cpq/followups', auth, wrap(async(req,res)=>{
-  const{quote_id,status,comment}=req.body;
+  const{quote_id,status,next_followup_date,comment}=req.body;
   if(!quote_id) return res.status(400).json({error:'quote_id required'});
   const[[q]]=await pool.query('SELECT quote_number,customer_name,total,currency FROM cpq_quotes WHERE id=?',[quote_id]);
   if(!q) return res.status(404).json({error:'Quote not found'});
   const[r]=await pool.query(
-    'INSERT INTO cpq_followups(quote_id,quote_number,customer_name,amount,currency,status,comment,followed_by,followed_by_name) VALUES(?,?,?,?,?,?,?,?,?)',
-    [quote_id,q.quote_number,q.customer_name,q.total||0,q.currency||'AED',status||'pending',comment||null,req.user.id,req.user.full_name||req.user.username]);
+    'INSERT INTO cpq_followups(quote_id,quote_number,customer_name,amount,currency,status,next_followup_date,comment,followed_by,followed_by_name) VALUES(?,?,?,?,?,?,?,?,?,?)',
+    [quote_id,q.quote_number,q.customer_name,q.total||0,q.currency||'AED',status||'draft',next_followup_date||null,comment||null,req.user.id,req.user.full_name||req.user.username]);
+  /* Sync quote status */
+  if(status) await pool.query('UPDATE cpq_quotes SET status=? WHERE id=?',[status,quote_id]).catch(()=>{});
   res.json({id:r.insertId,success:true,quote_number:q.quote_number,customer_name:q.customer_name,amount:q.total,currency:q.currency});
 }));
 
 /* PUT update follow-up (admin only) */
 app.put('/api/cpq/followups/:id', auth, adminOnly, wrap(async(req,res)=>{
-  const{status,comment}=req.body;
-  await pool.query('UPDATE cpq_followups SET status=?,comment=?,updated_at=NOW() WHERE id=?',[status||'pending',comment||null,req.params.id]);
+  const{status,next_followup_date,comment}=req.body;
+  await pool.query('UPDATE cpq_followups SET status=?,next_followup_date=?,comment=?,updated_at=NOW() WHERE id=?',
+    [status||'draft',next_followup_date||null,comment||null,req.params.id]);
+  /* Sync quote status */
+  if(status){
+    const[[fu]]=await pool.query('SELECT quote_id FROM cpq_followups WHERE id=?',[req.params.id]);
+    if(fu) await pool.query('UPDATE cpq_quotes SET status=? WHERE id=?',[status,fu.quote_id]).catch(()=>{});
+  }
+  res.json({success:true});
+}));
+
+/* DELETE follow-up (admin only) */
+app.delete('/api/cpq/followups/:id', auth, adminOnly, wrap(async(req,res)=>{
+  await pool.query('DELETE FROM cpq_followups WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
 
@@ -2244,7 +2262,7 @@ app.get('/api/cpq/followup-stats', auth, wrap(async(req,res)=>{
   const[pending]=await pool.query(
     `SELECT DISTINCT f.quote_id,f.quote_number,f.customer_name,f.amount,f.currency,f.status,f.created_at
      FROM cpq_followups f
-     WHERE f.status='pending'
+     WHERE f.status NOT IN ('accepted','rejected','cancelled')
      ORDER BY f.created_at DESC LIMIT 10`);
   /* Quotes not followed up in last 7 days (sent quotes only) */
   const[overdue]=await pool.query(
@@ -2252,8 +2270,8 @@ app.get('/api/cpq/followup-stats', auth, wrap(async(req,res)=>{
        MAX(f.created_at) as last_followup
      FROM cpq_quotes q
      LEFT JOIN cpq_followups f ON q.id=f.quote_id
-     WHERE q.status IN ('sent','draft')
-     GROUP BY q.id
+     WHERE q.status IN ('sent','draft','accepted')
+     GROUP BY q.id,q.quote_number,q.customer_name,q.total,q.currency,q.status,q.quote_date
      HAVING last_followup IS NULL OR last_followup < DATE_SUB(NOW(), INTERVAL 7 DAY)
      ORDER BY last_followup ASC LIMIT 10`);
   res.json({pending,overdue});
