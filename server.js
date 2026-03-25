@@ -279,12 +279,32 @@ async function setupDatabase(){
     await c.query(`CREATE TABLE IF NOT EXISTS clients(
       id INT AUTO_INCREMENT PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
+      country VARCHAR(100) DEFAULT 'United Arab Emirates',
+      city VARCHAR(100) DEFAULT NULL,
+      client_type ENUM('individual','company') DEFAULT 'company',
+      trn VARCHAR(50) DEFAULT NULL,
+      trn_not_registered TINYINT(1) DEFAULT 0,
+      additional_details TEXT DEFAULT NULL,
       email VARCHAR(255) DEFAULT NULL,
       phone VARCHAR(50) DEFAULT NULL,
-      address TEXT DEFAULT NULL,
-      trn VARCHAR(50) DEFAULT NULL,
+      contact_person VARCHAR(255) DEFAULT NULL,
+      contact_mobile VARCHAR(50) DEFAULT NULL,
       is_active TINYINT(1) DEFAULT 1,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+      created_by INT DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
+
+    /* Migrate existing clients table columns */
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS country VARCHAR(100) DEFAULT 'United Arab Emirates'").catch(()=>{});
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS city VARCHAR(100) DEFAULT NULL").catch(()=>{});
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS client_type ENUM('individual','company') DEFAULT 'company'").catch(()=>{});
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS trn_not_registered TINYINT(1) DEFAULT 0").catch(()=>{});
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS additional_details TEXT DEFAULT NULL").catch(()=>{});
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS contact_person VARCHAR(255) DEFAULT NULL").catch(()=>{});
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS contact_mobile VARCHAR(50) DEFAULT NULL").catch(()=>{});
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS created_by INT DEFAULT NULL").catch(()=>{});
+    await c.query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP").catch(()=>{});
 
     await c.query(`CREATE TABLE IF NOT EXISTS quotations(
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1679,21 +1699,49 @@ app.delete('/api/leave/:id', auth, wrap(async(req,res)=>{
    CLIENTS
 ══════════════════════════════════════ */
 app.get('/api/clients', auth, wrap(async(req,res)=>{
-  const[rows]=await pool.query('SELECT * FROM clients WHERE is_active=1 ORDER BY name');
+  const{search,type}=req.query;
+  let sql='SELECT * FROM clients WHERE is_active=1';
+  const params=[];
+  if(search){sql+=' AND (name LIKE ? OR email LIKE ? OR phone LIKE ? OR contact_person LIKE ?)';const q='%'+search+'%';params.push(q,q,q,q);}
+  if(type){sql+=' AND client_type=?';params.push(type);}
+  sql+=' ORDER BY name';
+  const[rows]=await pool.query(sql,params);
   res.json(rows);
 }));
 app.post('/api/clients', auth, wrap(async(req,res)=>{
-  const{name,email,phone,address,trn}=req.body;
-  if(!name) return res.status(400).json({error:'Client name required'});
-  const[r]=await pool.query('INSERT INTO clients(name,email,phone,address,trn) VALUES(?,?,?,?,?)',
-    [name,email||null,phone||null,address||null,trn||null]);
+  const{name,country,city,client_type,trn,trn_not_registered,additional_details,email,phone,contact_person,contact_mobile,address}=req.body;
+  if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
+  if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
+    return res.status(400).json({error:'VAT/TRN must be exactly 15 digits'});
+  }
+  const[r]=await pool.query(
+    'INSERT INTO clients(name,country,city,client_type,trn,trn_not_registered,additional_details,email,phone,contact_person,contact_mobile,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+    [name.trim(),country||'United Arab Emirates',city||null,client_type||'company',trn||null,trn_not_registered?1:0,additional_details||null,email||null,phone||null,contact_person||null,contact_mobile||null,req.user.id]);
   res.json({success:true,id:r.insertId});
 }));
 app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
-  const{name,email,phone,address,trn}=req.body;
-  await pool.query('UPDATE clients SET name=?,email=?,phone=?,address=?,trn=? WHERE id=?',
-    [name,email||null,phone||null,address||null,trn||null,req.params.id]);
+  const{name,country,city,client_type,trn,trn_not_registered,additional_details,email,phone,contact_person,contact_mobile}=req.body;
+  if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
+  if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
+    return res.status(400).json({error:'VAT/TRN must be exactly 15 digits'});
+  }
+  await pool.query(
+    'UPDATE clients SET name=?,country=?,city=?,client_type=?,trn=?,trn_not_registered=?,additional_details=?,email=?,phone=?,contact_person=?,contact_mobile=?,updated_at=NOW() WHERE id=?',
+    [name.trim(),country||'United Arab Emirates',city||null,client_type||'company',trn||null,trn_not_registered?1:0,additional_details||null,email||null,phone||null,contact_person||null,contact_mobile||null,req.params.id]);
   res.json({success:true});
+}));
+
+/* Soft-delete client */
+app.delete('/api/clients/:id', auth, wrap(async(req,res)=>{
+  await pool.query('UPDATE clients SET is_active=0 WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+/* Get single client */
+app.get('/api/clients/:id', auth, wrap(async(req,res)=>{
+  const[[c]]=await pool.query('SELECT * FROM clients WHERE id=?',[req.params.id]);
+  if(!c) return res.status(404).json({error:'Not found'});
+  res.json(c);
 }));
 app.delete('/api/clients/:id', auth, adminOnly, wrap(async(req,res)=>{
   await pool.query('UPDATE clients SET is_active=0 WHERE id=?',[req.params.id]);
