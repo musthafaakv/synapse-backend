@@ -1972,7 +1972,6 @@ app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
   for(let i=0;i<items.length;i++){
     const it=items[i];
     if(!it.product_name||!String(it.product_name).trim()) return res.status(400).json({error:'Row '+(i+1)+': Product name is required'});
-    if(!it.supplier_id&&!it.supplier_name) return res.status(400).json({error:'Row '+(i+1)+': Supplier is required'});
     if(!(parseFloat(it.cost)>0)) return res.status(400).json({error:'Row '+(i+1)+': Cost price must be greater than 0'});
     if(!(parseFloat(it.selling_price)>0)) return res.status(400).json({error:'Row '+(i+1)+': Sell price must be greater than 0'});
   }
