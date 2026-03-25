@@ -406,6 +406,53 @@ async function setupDatabase(){
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
 
     /* ── CPQ Tables ── */
+    /* CPQ T&C Templates (shared with DN) - already exists as dn_tc_templates */
+    /* BOQ Tables */
+    await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      boq_number VARCHAR(50) NOT NULL UNIQUE,
+      title VARCHAR(500) NOT NULL,
+      boq_date DATE NOT NULL,
+      status ENUM('draft','submitted','approved','rejected','converted') DEFAULT 'draft',
+      customer_id INT DEFAULT NULL,
+      customer_name VARCHAR(255) DEFAULT NULL,
+      customer_address TEXT DEFAULT NULL,
+      notes TEXT DEFAULT NULL,
+      currency VARCHAR(10) DEFAULT 'AED',
+      total_supplier_cost DECIMAL(14,2) DEFAULT 0,
+      total_selling DECIMAL(14,2) DEFAULT 0,
+      total_profit DECIMAL(14,2) DEFAULT 0,
+      converted_quote_id INT DEFAULT NULL,
+      created_by INT DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq_items(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      boq_id INT NOT NULL,
+      sort_order INT DEFAULT 0,
+      description TEXT NOT NULL,
+      qty DECIMAL(10,3) DEFAULT 1,
+      unit VARCHAR(50) DEFAULT 'pcs',
+      supplier_cost DECIMAL(12,4) DEFAULT 0,
+      unit_price DECIMAL(12,4) DEFAULT 0,
+      total_price DECIMAL(14,2) DEFAULT 0,
+      notes VARCHAR(500) DEFAULT NULL,
+      product_id INT DEFAULT NULL,
+      FOREIGN KEY(boq_id) REFERENCES cpq_boq(id) ON DELETE CASCADE,
+      FOREIGN KEY(product_id) REFERENCES cpq_products(id) ON DELETE SET NULL)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq_supplier_prices(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      boq_item_id INT NOT NULL,
+      supplier_id INT DEFAULT NULL,
+      supplier_name VARCHAR(255) NOT NULL,
+      cost DECIMAL(12,4) NOT NULL DEFAULT 0,
+      currency VARCHAR(10) DEFAULT 'AED',
+      notes VARCHAR(500) DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(boq_item_id) REFERENCES cpq_boq_items(id) ON DELETE CASCADE)`);
     await c.query(`CREATE TABLE IF NOT EXISTS cpq_products(
       id INT AUTO_INCREMENT PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
@@ -2015,6 +2062,97 @@ app.post('/api/cpq/quotes/:id/duplicate', auth, wrap(async(req,res)=>{
       [qid,it.sort_order,it.product_id,it.product_name,it.description,it.category,it.supplier_id,it.supplier_name,it.qty,it.unit,it.cost,it.currency,it.markup_pct,it.selling_price,it.line_total,it.line_profit]);
   }
   res.json({success:true,id:qid,quote_number:qnum});
+}));
+
+/* BOQ number generator */
+async function nextBOQNumber(){
+  const y=new Date().getFullYear();
+  const[[row]]=await pool.query("SELECT MAX(CAST(SUBSTRING_INDEX(boq_number,'/',-1) AS UNSIGNED)) as mx FROM cpq_boq WHERE boq_number LIKE ?",['BOQ/CCT/'+y+'-%']);
+  return `BOQ/CCT/${y}-${String((row?.mx||0)+1).padStart(3,'0')}`;
+}
+
+/* BOQ CRUD */
+app.get('/api/cpq/boq', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT b.*,u.full_name as creator_name FROM cpq_boq b LEFT JOIN users u ON b.created_by=u.id ORDER BY b.created_at DESC LIMIT 100');
+  res.json(rows);
+}));
+app.get('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
+  const[[b]]=await pool.query('SELECT b.*,u.full_name as creator_name FROM cpq_boq b LEFT JOIN users u ON b.created_by=u.id WHERE b.id=?',[req.params.id]);
+  if(!b) return res.status(404).json({error:'Not found'});
+  const[items]=await pool.query('SELECT * FROM cpq_boq_items WHERE boq_id=? ORDER BY sort_order,id',[req.params.id]);
+  /* Attach supplier prices to each item */
+  for(const it of items){
+    const[sp]=await pool.query('SELECT * FROM cpq_boq_supplier_prices WHERE boq_item_id=? ORDER BY cost',[it.id]);
+    it.supplier_prices=sp;
+  }
+  res.json({...b,items});
+}));
+app.post('/api/cpq/boq', auth, wrap(async(req,res)=>{
+  const{title,boq_date,status,customer_id,customer_name,customer_address,notes,currency,total_supplier_cost,total_selling,total_profit,items}=req.body;
+  if(!title) return res.status(400).json({error:'Title required'});
+  const bnum=await nextBOQNumber();
+  const[r]=await pool.query(
+    'INSERT INTO cpq_boq(boq_number,title,boq_date,status,customer_id,customer_name,customer_address,notes,currency,total_supplier_cost,total_selling,total_profit,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [bnum,title,boq_date||localDate(new Date()),status||'draft',customer_id||null,customer_name||null,customer_address||null,notes||null,currency||'AED',total_supplier_cost||0,total_selling||0,total_profit||0,req.user.id]);
+  const bid=r.insertId;
+  if(items&&items.length){
+    for(let i=0;i<items.length;i++){
+      const it=items[i];
+      const[ir]=await pool.query('INSERT INTO cpq_boq_items(boq_id,sort_order,description,qty,unit,supplier_cost,unit_price,total_price,notes,product_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        [bid,i,it.description||'',parseFloat(it.qty)||1,it.unit||'pcs',parseFloat(it.supplier_cost)||0,parseFloat(it.unit_price)||0,parseFloat(it.total_price)||0,it.notes||null,it.product_id||null]);
+      if(it.supplier_prices&&it.supplier_prices.length){
+        for(const sp of it.supplier_prices){
+          await pool.query('INSERT INTO cpq_boq_supplier_prices(boq_item_id,supplier_id,supplier_name,cost,currency,notes) VALUES(?,?,?,?,?,?)',
+            [ir.insertId,sp.supplier_id||null,sp.supplier_name||'',parseFloat(sp.cost)||0,sp.currency||'AED',sp.notes||null]);
+        }
+      }
+    }
+  }
+  res.json({success:true,id:bid,boq_number:bnum});
+}));
+app.put('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
+  const{title,boq_date,status,customer_id,customer_name,customer_address,notes,currency,total_supplier_cost,total_selling,total_profit,items}=req.body;
+  await pool.query('UPDATE cpq_boq SET title=?,boq_date=?,status=?,customer_id=?,customer_name=?,customer_address=?,notes=?,currency=?,total_supplier_cost=?,total_selling=?,total_profit=?,updated_at=NOW() WHERE id=?',
+    [title,boq_date,status||'draft',customer_id||null,customer_name||null,customer_address||null,notes||null,currency||'AED',total_supplier_cost||0,total_selling||0,total_profit||0,req.params.id]);
+  if(items){
+    /* Delete old items and re-insert */
+    await pool.query('DELETE FROM cpq_boq_items WHERE boq_id=?',[req.params.id]);
+    for(let i=0;i<items.length;i++){
+      const it=items[i];
+      const[ir]=await pool.query('INSERT INTO cpq_boq_items(boq_id,sort_order,description,qty,unit,supplier_cost,unit_price,total_price,notes,product_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        [req.params.id,i,it.description||'',parseFloat(it.qty)||1,it.unit||'pcs',parseFloat(it.supplier_cost)||0,parseFloat(it.unit_price)||0,parseFloat(it.total_price)||0,it.notes||null,it.product_id||null]);
+      if(it.supplier_prices&&it.supplier_prices.length){
+        for(const sp of it.supplier_prices){
+          await pool.query('INSERT INTO cpq_boq_supplier_prices(boq_item_id,supplier_id,supplier_name,cost,currency,notes) VALUES(?,?,?,?,?,?)',
+            [ir.insertId,sp.supplier_id||null,sp.supplier_name||'',parseFloat(sp.cost)||0,sp.currency||'AED',sp.notes||null]);
+        }
+      }
+    }
+  }
+  res.json({success:true});
+}));
+app.delete('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
+  await pool.query('DELETE FROM cpq_boq WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+/* Convert BOQ to Quote */
+app.post('/api/cpq/boq/:id/convert', auth, wrap(async(req,res)=>{
+  const[[boq]]=await pool.query('SELECT * FROM cpq_boq WHERE id=?',[req.params.id]);
+  if(!boq) return res.status(404).json({error:'BOQ not found'});
+  const[boqItems]=await pool.query('SELECT * FROM cpq_boq_items WHERE boq_id=? ORDER BY sort_order',[req.params.id]);
+  const qnum=await nextCPQNumber();
+  const[qr]=await pool.query(
+    'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_address,notes,currency,subtotal,total,total_cost,total_profit,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [qnum,localDate(new Date()),null,'draft',boq.customer_name,boq.customer_address,'Converted from BOQ '+boq.boq_number,boq.currency,boq.total_selling,boq.total_selling,boq.total_supplier_cost,boq.total_profit,req.user.id]);
+  const qid=qr.insertId;
+  for(let i=0;i<boqItems.length;i++){
+    const it=boqItems[i];
+    await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,description,qty,unit,cost,markup_pct,selling_price,line_total,line_profit,currency) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      [qid,i,it.product_id||null,it.description,it.description,parseFloat(it.qty)||1,it.unit||'pcs',parseFloat(it.supplier_cost)||0,0,parseFloat(it.unit_price)||0,parseFloat(it.total_price)||0,(parseFloat(it.unit_price)-parseFloat(it.supplier_cost))*parseFloat(it.qty),boq.currency]);
+  }
+  await pool.query('UPDATE cpq_boq SET status=?,converted_quote_id=? WHERE id=?',['converted',qid,req.params.id]);
+  res.json({success:true,quote_id:qid,quote_number:qnum});
 }));
 
 /* ══════════════════════════════════════
