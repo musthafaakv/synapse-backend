@@ -405,6 +405,89 @@ async function setupDatabase(){
       created_by INT DEFAULT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
 
+    /* ── CPQ Tables ── */
+    await c.query(`CREATE TABLE IF NOT EXISTS cpq_products(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      description TEXT DEFAULT NULL,
+      category VARCHAR(100) DEFAULT NULL,
+      sku VARCHAR(100) DEFAULT NULL,
+      unit VARCHAR(50) DEFAULT 'pcs',
+      is_active TINYINT(1) DEFAULT 1,
+      created_by INT DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS cpq_suppliers(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      contact_name VARCHAR(255) DEFAULT NULL,
+      email VARCHAR(255) DEFAULT NULL,
+      phone VARCHAR(50) DEFAULT NULL,
+      notes TEXT DEFAULT NULL,
+      is_active TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS cpq_prices(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      product_id INT NOT NULL,
+      supplier_id INT NOT NULL,
+      cost DECIMAL(12,4) NOT NULL DEFAULT 0,
+      currency VARCHAR(10) DEFAULT 'AED',
+      last_updated DATE DEFAULT NULL,
+      notes VARCHAR(500) DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_prod_sup(product_id,supplier_id),
+      FOREIGN KEY(product_id) REFERENCES cpq_products(id) ON DELETE CASCADE,
+      FOREIGN KEY(supplier_id) REFERENCES cpq_suppliers(id) ON DELETE CASCADE)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS cpq_quotes(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      quote_number VARCHAR(50) NOT NULL UNIQUE,
+      quote_date DATE NOT NULL,
+      valid_till DATE DEFAULT NULL,
+      status ENUM('draft','sent','accepted','rejected','cancelled') DEFAULT 'draft',
+      customer_name VARCHAR(255) DEFAULT NULL,
+      customer_email VARCHAR(255) DEFAULT NULL,
+      customer_phone VARCHAR(50) DEFAULT NULL,
+      customer_address TEXT DEFAULT NULL,
+      subject VARCHAR(500) DEFAULT NULL,
+      notes TEXT DEFAULT NULL,
+      discount_pct DECIMAL(5,2) DEFAULT 0,
+      subtotal DECIMAL(14,2) DEFAULT 0,
+      discount_amount DECIMAL(14,2) DEFAULT 0,
+      total DECIMAL(14,2) DEFAULT 0,
+      total_cost DECIMAL(14,2) DEFAULT 0,
+      total_profit DECIMAL(14,2) DEFAULT 0,
+      currency VARCHAR(10) DEFAULT 'AED',
+      created_by INT DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
+
+    await c.query(`CREATE TABLE IF NOT EXISTS cpq_quote_items(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      quote_id INT NOT NULL,
+      sort_order INT DEFAULT 0,
+      product_id INT DEFAULT NULL,
+      product_name VARCHAR(255) NOT NULL,
+      description TEXT DEFAULT NULL,
+      category VARCHAR(100) DEFAULT NULL,
+      supplier_id INT DEFAULT NULL,
+      supplier_name VARCHAR(255) DEFAULT NULL,
+      qty DECIMAL(10,3) DEFAULT 1,
+      unit VARCHAR(50) DEFAULT 'pcs',
+      cost DECIMAL(12,4) DEFAULT 0,
+      currency VARCHAR(10) DEFAULT 'AED',
+      markup_pct DECIMAL(7,2) DEFAULT 0,
+      selling_price DECIMAL(12,4) DEFAULT 0,
+      line_total DECIMAL(14,2) DEFAULT 0,
+      line_profit DECIMAL(14,2) DEFAULT 0,
+      FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,
+      FOREIGN KEY(product_id) REFERENCES cpq_products(id) ON DELETE SET NULL,
+      FOREIGN KEY(supplier_id) REFERENCES cpq_suppliers(id) ON DELETE SET NULL)`);
+
     /* Migrations for quotations table */
     await c.query("ALTER TABLE quotations ADD COLUMN version INT DEFAULT 1").catch(()=>{});
     await c.query("ALTER TABLE quotations ADD COLUMN quotation_number_custom VARCHAR(100) DEFAULT NULL").catch(()=>{});
@@ -1791,6 +1874,147 @@ app.put('/api/admin/attendance/:id/override-time', auth, adminOnly, wrap(async(r
     `UPDATE attendance SET clock_in=COALESCE(?,clock_in),clock_out=COALESCE(?,clock_out),approved_clock_in=COALESCE(?,approved_clock_in),approved_clock_out=COALESCE(?,approved_clock_out),admin_note=COALESCE(?,admin_note)${flagUpdate},updated_at=NOW() WHERE id=?`,
     [ciVal,coVal,ciVal,coVal,notes||null,req.params.id]);
   res.json({success:true});
+}));
+
+/* ══════════════════════════════════════
+   CPQ — Configure Price Quote
+══════════════════════════════════════ */
+
+/* Quote number generator */
+async function nextCPQNumber(){
+  const y=new Date().getFullYear();
+  const[[row]]=await pool.query("SELECT MAX(CAST(SUBSTRING_INDEX(quote_number,'/',-1) AS UNSIGNED)) as mx FROM cpq_quotes WHERE quote_number LIKE ?",['CPQ/CCT/'+y+'-%']);
+  return `CPQ/CCT/${y}-${String((row?.mx||0)+1).padStart(3,'0')}`;
+}
+
+/* Products */
+app.get('/api/cpq/products', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT p.*,COUNT(pr.id) as price_count FROM cpq_products p LEFT JOIN cpq_prices pr ON p.id=pr.product_id WHERE p.is_active=1 GROUP BY p.id ORDER BY p.category,p.name');
+  res.json(rows);
+}));
+app.post('/api/cpq/products', auth, wrap(async(req,res)=>{
+  const{name,description,category,sku,unit}=req.body;
+  if(!name) return res.status(400).json({error:'Name required'});
+  const[r]=await pool.query('INSERT INTO cpq_products(name,description,category,sku,unit,created_by) VALUES(?,?,?,?,?,?)',
+    [name,description||null,category||null,sku||null,unit||'pcs',req.user.id]);
+  res.json({success:true,id:r.insertId});
+}));
+app.put('/api/cpq/products/:id', auth, wrap(async(req,res)=>{
+  const{name,description,category,sku,unit}=req.body;
+  await pool.query('UPDATE cpq_products SET name=?,description=?,category=?,sku=?,unit=? WHERE id=?',
+    [name,description||null,category||null,sku||null,unit||'pcs',req.params.id]);
+  res.json({success:true});
+}));
+app.delete('/api/cpq/products/:id', auth, wrap(async(req,res)=>{
+  await pool.query('UPDATE cpq_products SET is_active=0 WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+app.get('/api/cpq/products/:id/prices', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT pr.*,s.name as supplier_name FROM cpq_prices pr JOIN cpq_suppliers s ON pr.supplier_id=s.id WHERE pr.product_id=? AND s.is_active=1 ORDER BY pr.cost',
+    [req.params.id]);
+  res.json(rows);
+}));
+
+/* Suppliers */
+app.get('/api/cpq/suppliers', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT s.*,COUNT(pr.id) as product_count FROM cpq_suppliers s LEFT JOIN cpq_prices pr ON s.id=pr.supplier_id WHERE s.is_active=1 GROUP BY s.id ORDER BY s.name');
+  res.json(rows);
+}));
+app.post('/api/cpq/suppliers', auth, wrap(async(req,res)=>{
+  const{name,contact_name,email,phone,notes}=req.body;
+  if(!name) return res.status(400).json({error:'Supplier name required'});
+  const[r]=await pool.query('INSERT INTO cpq_suppliers(name,contact_name,email,phone,notes) VALUES(?,?,?,?,?)',
+    [name,contact_name||null,email||null,phone||null,notes||null]);
+  res.json({success:true,id:r.insertId});
+}));
+app.put('/api/cpq/suppliers/:id', auth, wrap(async(req,res)=>{
+  const{name,contact_name,email,phone,notes}=req.body;
+  await pool.query('UPDATE cpq_suppliers SET name=?,contact_name=?,email=?,phone=?,notes=? WHERE id=?',
+    [name,contact_name||null,email||null,phone||null,notes||null,req.params.id]);
+  res.json({success:true});
+}));
+app.delete('/api/cpq/suppliers/:id', auth, wrap(async(req,res)=>{
+  await pool.query('UPDATE cpq_suppliers SET is_active=0 WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+/* Supplier prices */
+app.post('/api/cpq/prices', auth, wrap(async(req,res)=>{
+  const{product_id,supplier_id,cost,currency,last_updated,notes}=req.body;
+  if(!product_id||!supplier_id) return res.status(400).json({error:'product_id and supplier_id required'});
+  await pool.query(
+    'INSERT INTO cpq_prices(product_id,supplier_id,cost,currency,last_updated,notes) VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE cost=VALUES(cost),currency=VALUES(currency),last_updated=VALUES(last_updated),notes=VALUES(notes)',
+    [product_id,supplier_id,cost||0,currency||'AED',last_updated||null,notes||null]);
+  res.json({success:true});
+}));
+app.delete('/api/cpq/prices/:id', auth, wrap(async(req,res)=>{
+  await pool.query('DELETE FROM cpq_prices WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+/* Quotes */
+app.get('/api/cpq/quotes', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT q.*,u.full_name as creator_name FROM cpq_quotes q LEFT JOIN users u ON q.created_by=u.id ORDER BY q.created_at DESC LIMIT 100');
+  res.json(rows);
+}));
+app.get('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
+  const[[q]]=await pool.query('SELECT q.*,u.full_name as creator_name FROM cpq_quotes q LEFT JOIN users u ON q.created_by=u.id WHERE q.id=?',[req.params.id]);
+  if(!q) return res.status(404).json({error:'Not found'});
+  const[items]=await pool.query('SELECT * FROM cpq_quote_items WHERE quote_id=? ORDER BY sort_order,id',[req.params.id]);
+  res.json({...q,items});
+}));
+app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
+  const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,items}=req.body;
+  const qnum=await nextCPQNumber();
+  const[r]=await pool.query(
+    'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [qnum,quote_date||localDate(new Date()),valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',req.user.id]);
+  const qid=r.insertId;
+  if(items&&items.length){
+    for(let i=0;i<items.length;i++){
+      const it=items[i];
+      await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [qid,i,it.product_id||null,it.product_name||'',it.description||null,it.category||null,it.supplier_id||null,it.supplier_name||null,it.qty||1,it.unit||'pcs',it.cost||0,it.currency||'AED',it.markup_pct||0,it.selling_price||0,it.line_total||0,it.line_profit||0]);
+    }
+  }
+  res.json({success:true,id:qid,quote_number:qnum});
+}));
+app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
+  const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,items}=req.body;
+  await pool.query(
+    'UPDATE cpq_quotes SET quote_date=?,valid_till=?,status=?,customer_name=?,customer_email=?,customer_phone=?,customer_address=?,subject=?,notes=?,discount_pct=?,subtotal=?,discount_amount=?,total=?,total_cost=?,total_profit=?,currency=?,updated_at=NOW() WHERE id=?',
+    [quote_date,valid_till||null,status||'draft',customer_name||null,customer_email||null,customer_phone||null,customer_address||null,subject||null,notes||null,discount_pct||0,subtotal||0,discount_amount||0,total||0,total_cost||0,total_profit||0,currency||'AED',req.params.id]);
+  if(items){
+    await pool.query('DELETE FROM cpq_quote_items WHERE quote_id=?',[req.params.id]);
+    for(let i=0;i<items.length;i++){
+      const it=items[i];
+      await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [req.params.id,i,it.product_id||null,it.product_name||'',it.description||null,it.category||null,it.supplier_id||null,it.supplier_name||null,it.qty||1,it.unit||'pcs',it.cost||0,it.currency||'AED',it.markup_pct||0,it.selling_price||0,it.line_total||0,it.line_profit||0]);
+    }
+  }
+  res.json({success:true});
+}));
+app.delete('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
+  await pool.query('DELETE FROM cpq_quotes WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+/* Duplicate quote */
+app.post('/api/cpq/quotes/:id/duplicate', auth, wrap(async(req,res)=>{
+  const[[orig]]=await pool.query('SELECT * FROM cpq_quotes WHERE id=?',[req.params.id]);
+  if(!orig) return res.status(404).json({error:'Not found'});
+  const[origItems]=await pool.query('SELECT * FROM cpq_quote_items WHERE quote_id=? ORDER BY sort_order',[req.params.id]);
+  const qnum=await nextCPQNumber();
+  const[r]=await pool.query(
+    'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [qnum,localDate(new Date()),orig.valid_till,'draft',orig.customer_name,orig.customer_email,orig.customer_phone,orig.customer_address,orig.subject,orig.notes,orig.discount_pct,orig.subtotal,orig.discount_amount,orig.total,orig.total_cost,orig.total_profit,orig.currency,req.user.id]);
+  const qid=r.insertId;
+  for(const it of origItems){
+    await pool.query('INSERT INTO cpq_quote_items(quote_id,sort_order,product_id,product_name,description,category,supplier_id,supplier_name,qty,unit,cost,currency,markup_pct,selling_price,line_total,line_profit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      [qid,it.sort_order,it.product_id,it.product_name,it.description,it.category,it.supplier_id,it.supplier_name,it.qty,it.unit,it.cost,it.currency,it.markup_pct,it.selling_price,it.line_total,it.line_profit]);
+  }
+  res.json({success:true,id:qid,quote_number:qnum});
 }));
 
 /* ══════════════════════════════════════
