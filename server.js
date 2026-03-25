@@ -1968,6 +1968,16 @@ app.get('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
 }));
 app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
   const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,contact_person,items,quote_number_override}=req.body;
+  /* Server-side validation */
+  if(!customer_name&&!req.body.customer_id) return res.status(400).json({error:'Customer is required'});
+  if(!items||!items.length) return res.status(400).json({error:'At least one line item is required'});
+  for(let i=0;i<items.length;i++){
+    const it=items[i];
+    if(!it.product_name||!String(it.product_name).trim()) return res.status(400).json({error:'Row '+(i+1)+': Product name is required'});
+    if(!it.supplier_id&&!it.supplier_name) return res.status(400).json({error:'Row '+(i+1)+': Supplier is required'});
+    if(!(parseFloat(it.cost)>0)) return res.status(400).json({error:'Row '+(i+1)+': Cost price must be greater than 0'});
+    if(!(parseFloat(it.selling_price)>0)) return res.status(400).json({error:'Row '+(i+1)+': Sell price must be greater than 0'});
+  }
   const qnum=quote_number_override||await nextCPQNumber();
   const[r]=await pool.query(
     'INSERT INTO cpq_quotes(quote_number,quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,contact_person,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
