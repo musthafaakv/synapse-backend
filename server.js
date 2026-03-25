@@ -2002,6 +2002,17 @@ app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
   res.json({success:true,id:qid,quote_number:qnum});
 }));
 app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
+  /* 14-day lock: only admin can edit after 14 days */
+  if(req.user.role!=='admin'){
+    const[[lockChk]]=await pool.query('SELECT created_at FROM cpq_quotes WHERE id=?',[req.params.id]);
+    if(lockChk){
+      const ageMs=Date.now()-new Date(lockChk.created_at).getTime();
+      const ageDays=ageMs/(1000*60*60*24);
+      if(ageDays>14){
+        return res.status(403).json({error:'Editing is disabled after 14 days. Only Admin can modify this quotation.'});
+      }
+    }
+  }
   const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,customer_city,customer_country,contact_person,vat_rate,vat_amount,items,quote_number_override,prepared_by_override}=req.body;
   await pool.query(
     'UPDATE cpq_quotes SET quote_date=?,valid_till=?,status=?,customer_name=?,customer_email=?,customer_phone=?,customer_address=?,subject=?,notes=?,discount_pct=?,subtotal=?,discount_amount=?,total=?,total_cost=?,total_profit=?,currency=?,version_number=?,customer_trn=?,customer_city=?,customer_country=?,contact_person=?,vat_rate=?,vat_amount=?,last_modified_by=?,last_modified_by_name=?,prepared_by_override=?,updated_at=NOW() WHERE id=?',
