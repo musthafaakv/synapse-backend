@@ -458,7 +458,9 @@ async function setupDatabase(){
     }
     await c.query('CREATE TABLE IF NOT EXISTS cpq_followups(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,quote_number VARCHAR(50),customer_name VARCHAR(255),amount DECIMAL(14,2) DEFAULT 0,currency VARCHAR(10) DEFAULT \'AED\',status VARCHAR(50) DEFAULT \'draft\',next_followup_date DATE DEFAULT NULL,comment TEXT DEFAULT NULL,followed_by INT DEFAULT NULL,followed_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(quote_id),INDEX(next_followup_date),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(followed_by) REFERENCES users(id) ON DELETE SET NULL)');
         /* cpq_followups column migrations */
-        await c.query("ALTER TABLE cpq_followups ADD COLUMN IF NOT EXISTS next_followup_date DATE DEFAULT NULL").catch(()=>{});
+        /* Safe migration: try adding column, ignore error if exists */
+        await c.query('ALTER TABLE cpq_followups ADD COLUMN next_followup_date DATE DEFAULT NULL').catch(()=>{});
+        await c.query("ALTER TABLE cpq_followups MODIFY COLUMN status VARCHAR(50) DEFAULT 'draft'").catch(()=>{});
         await c.query('CREATE TABLE IF NOT EXISTS cpq_quote_logs(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(quote_id),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(changed_by) REFERENCES users(id) ON DELETE SET NULL)');
     await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq(
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -682,7 +684,7 @@ const auth = async(req,res,next)=>{
 };
 const adminOnly=(req,res,next)=>req.user?.role==='admin'?next():res.status(403).json({error:'Admin only'});
 const adminOrSupervisor=(req,res,next)=>(req.user?.role==='admin'||req.user?.role==='supervisor')?next():res.status(403).json({error:'Insufficient permissions'});
-const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(e=>{console.error(e.message);res.status(500).json({error:e.message||'Server error'});});
+const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(e=>{console.error('[wrap error]',req.method,req.path,e.message);res.status(500).json({error:e.message||'Server error'});});
 
 const localDate=(d=new Date())=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),dd=String(d.getDate()).padStart(2,'0');return`${y}-${m}-${dd}`;};
 const toMySQL=(val)=>{if(!val)return null;if(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(val))return val;const d=new Date(val);if(isNaN(d.getTime()))return null;const p=n=>String(n).padStart(2,'0');return`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;};
@@ -2619,6 +2621,8 @@ app.post('/api/admin/smtp/test-send', auth, adminOnly, wrap(async(req,res)=>{
    START SERVER
 ══════════════════════════════════════ */
 const PORT = process.env.PORT || 3001;
+/* 404 handler — return JSON not HTML */
+app.use((req,res)=>{res.status(404).json({error:'Route not found: '+req.method+' '+req.path});});
 setupDatabase().then(() => {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }).catch(err => {
