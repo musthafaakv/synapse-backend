@@ -333,6 +333,7 @@ async function setupDatabase(){
       client_phone VARCHAR(50) DEFAULT NULL,
       client_address TEXT DEFAULT NULL,
       client_trn VARCHAR(50) DEFAULT NULL,
+      contact_person VARCHAR(255) DEFAULT NULL,
       currency VARCHAR(10) DEFAULT 'AED',
       vat_rate DECIMAL(5,2) DEFAULT 5.00,
       subtotal DECIMAL(12,2) DEFAULT 0.00,
@@ -347,6 +348,12 @@ async function setupDatabase(){
       FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE SET NULL,
       FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
 
+    /* Migrate quotations table - safe column check */
+    const quotCols=await c.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='quotations'");
+    const existQCols=new Set((quotCols[0]||[]).map(r=>r.COLUMN_NAME));
+    if(!existQCols.has('contact_person')){
+      await c.query("ALTER TABLE quotations ADD COLUMN contact_person VARCHAR(255) DEFAULT NULL AFTER client_trn").catch(e=>console.log('migrate quotations contact_person:',e.message));
+    }
     await c.query(`CREATE TABLE IF NOT EXISTS quotation_items(
       id INT AUTO_INCREMENT PRIMARY KEY,
       quotation_id INT NOT NULL,
@@ -1803,7 +1810,7 @@ app.get('/api/quotations/:id', auth, wrap(async(req,res)=>{
 }));
 
 app.post('/api/quotations', auth, wrap(async(req,res)=>{
-  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items,quotation_number_custom}=req.body;
+  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,contact_person,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items,quotation_number_custom}=req.body;
   const qnum=quotation_number_custom||await nextQuotationNumber();
   const[r]=await pool.query(
     'INSERT INTO quotations(quotation_number,quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,created_by,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -1820,14 +1827,14 @@ app.post('/api/quotations', auth, wrap(async(req,res)=>{
 }));
 
 app.put('/api/quotations/:id', auth, wrap(async(req,res)=>{
-  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items,quotation_number_custom,version}=req.body;
+  const{quotation_date,valid_till,subject,client_id,client_name,client_email,client_phone,client_address,client_trn,contact_person,currency,vat_rate,subtotal,vat_amount,discount_amount,total,notes,status,items,quotation_number_custom,version}=req.body;
   /* Get current version to auto-increment */
   const[[cur]]=await pool.query('SELECT version,quotation_number FROM quotations WHERE id=?',[req.params.id]);
   const newVersion=version!=null?parseInt(version):(parseInt(cur?.version||1)+1);
   const newQnum=quotation_number_custom||cur?.quotation_number;
   await pool.query(
-    'UPDATE quotations SET quotation_number=?,quotation_date=?,valid_till=?,subject=?,client_id=?,client_name=?,client_email=?,client_phone=?,client_address=?,client_trn=?,currency=?,vat_rate=?,subtotal=?,vat_amount=?,discount_amount=?,total=?,notes=?,status=?,version=?,updated_at=NOW() WHERE id=?',
-    [newQnum,quotation_date,valid_till||null,subject||null,client_id||null,client_name||null,client_email||null,client_phone||null,client_address||null,client_trn||null,currency||'AED',vat_rate??5,subtotal||0,vat_amount||0,discount_amount||0,total||0,notes||null,status||'created',newVersion,req.params.id]);
+    'UPDATE quotations SET quotation_number=?,quotation_date=?,valid_till=?,subject=?,client_id=?,client_name=?,client_email=?,client_phone=?,client_address=?,client_trn=?,contact_person=?,currency=?,vat_rate=?,subtotal=?,vat_amount=?,discount_amount=?,total=?,notes=?,status=?,version=?,updated_at=NOW() WHERE id=?',
+    [newQnum,quotation_date,valid_till||null,subject||null,client_id||null,client_name||null,client_email||null,client_phone||null,client_address||null,client_trn||null,contact_person||null,currency||'AED',vat_rate??5,subtotal||0,vat_amount||0,discount_amount||0,total||0,notes||null,status||'created',newVersion,req.params.id]);
   await pool.query('DELETE FROM quotation_items WHERE quotation_id=?',[req.params.id]);
   if(items&&items.length){
     for(let i=0;i<items.length;i++){
