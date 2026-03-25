@@ -288,6 +288,9 @@ async function setupDatabase(){
       email VARCHAR(255) DEFAULT NULL,
       phone VARCHAR(50) DEFAULT NULL,
       contact_person VARCHAR(255) DEFAULT NULL,
+      building_number VARCHAR(20) DEFAULT NULL,
+      street_address VARCHAR(500) DEFAULT NULL,
+      postal_code VARCHAR(20) DEFAULT NULL,
       contact_mobile VARCHAR(50) DEFAULT NULL,
       is_active TINYINT(1) DEFAULT 1,
       created_by INT DEFAULT NULL,
@@ -299,15 +302,18 @@ async function setupDatabase(){
     const clientCols = await c.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='clients'");
     const existingCols = new Set((clientCols[0]||[]).map(r=>r.COLUMN_NAME));
     const clientAlters = [
-      ["country",   "VARCHAR(100) DEFAULT 'United Arab Emirates'"],
-      ["city",       "VARCHAR(100) DEFAULT NULL"],
-      ["client_type","ENUM('individual','company') DEFAULT 'company'"],
+      ["country",       "VARCHAR(100) DEFAULT 'United Arab Emirates'"],
+      ["city",          "VARCHAR(100) DEFAULT NULL"],
+      ["client_type",   "ENUM('individual','company') DEFAULT 'company'"],
       ["trn_not_registered","TINYINT(1) DEFAULT 0"],
       ["additional_details","TEXT DEFAULT NULL"],
+      ["building_number","VARCHAR(20) DEFAULT NULL"],
+      ["street_address", "VARCHAR(500) DEFAULT NULL"],
+      ["postal_code",    "VARCHAR(20) DEFAULT NULL"],
       ["contact_person","VARCHAR(255) DEFAULT NULL"],
       ["contact_mobile","VARCHAR(50) DEFAULT NULL"],
-      ["created_by","INT DEFAULT NULL"],
-      ["updated_at","TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"],
+      ["created_by",    "INT DEFAULT NULL"],
+      ["updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"],
     ];
     for(const [col,def] of clientAlters){
       if(!existingCols.has(col)){
@@ -1718,25 +1724,25 @@ app.get('/api/clients', auth, wrap(async(req,res)=>{
   res.json(rows);
 }));
 app.post('/api/clients', auth, wrap(async(req,res)=>{
-  const{name,country,city,client_type,trn,trn_not_registered,additional_details,email,phone,contact_person,contact_mobile,address}=req.body;
+  const{name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile,address}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
   if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
     return res.status(400).json({error:'VAT/TRN must be exactly 15 digits'});
   }
   const[r]=await pool.query(
-    'INSERT INTO clients(name,country,city,client_type,trn,trn_not_registered,additional_details,email,phone,contact_person,contact_mobile,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-    [name.trim(),country||'United Arab Emirates',city||null,client_type||'company',trn||null,trn_not_registered?1:0,additional_details||null,email||null,phone||null,contact_person||null,contact_mobile||null,req.user.id]);
+    'INSERT INTO clients(name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [name.trim(),country||'United Arab Emirates',city||null,client_type||'company',trn||null,trn_not_registered?1:0,additional_details||null,building_number||null,street_address||null,postal_code||null,email||null,phone||null,contact_person||null,contact_mobile||null,req.user.id]);
   res.json({success:true,id:r.insertId});
 }));
 app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
-  const{name,country,city,client_type,trn,trn_not_registered,additional_details,email,phone,contact_person,contact_mobile}=req.body;
+  const{name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
   if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
     return res.status(400).json({error:'VAT/TRN must be exactly 15 digits'});
   }
   await pool.query(
-    'UPDATE clients SET name=?,country=?,city=?,client_type=?,trn=?,trn_not_registered=?,additional_details=?,email=?,phone=?,contact_person=?,contact_mobile=?,updated_at=NOW() WHERE id=?',
-    [name.trim(),country||'United Arab Emirates',city||null,client_type||'company',trn||null,trn_not_registered?1:0,additional_details||null,email||null,phone||null,contact_person||null,contact_mobile||null,req.params.id]);
+    'UPDATE clients SET name=?,country=?,city=?,client_type=?,trn=?,trn_not_registered=?,additional_details=?,building_number=?,street_address=?,postal_code=?,email=?,phone=?,contact_person=?,contact_mobile=?,updated_at=NOW() WHERE id=?',
+    [name.trim(),country||'United Arab Emirates',city||null,client_type||'company',trn||null,trn_not_registered?1:0,additional_details||null,building_number||null,street_address||null,postal_code||null,email||null,phone||null,contact_person||null,contact_mobile||null,req.params.id]);
   res.json({success:true});
 }));
 
