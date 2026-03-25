@@ -457,6 +457,8 @@ async function setupDatabase(){
       await c.query("ALTER TABLE cpq_quote_items ADD COLUMN sku VARCHAR(100) DEFAULT NULL AFTER product_name").catch(e=>console.log('migrate cpq_quote_items sku:',e.message));
     }
     await c.query('CREATE TABLE IF NOT EXISTS cpq_followups(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,quote_number VARCHAR(50),customer_name VARCHAR(255),amount DECIMAL(14,2) DEFAULT 0,currency VARCHAR(10) DEFAULT \'AED\',status VARCHAR(50) DEFAULT \'draft\',next_followup_date DATE DEFAULT NULL,comment TEXT DEFAULT NULL,followed_by INT DEFAULT NULL,followed_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(quote_id),INDEX(next_followup_date),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(followed_by) REFERENCES users(id) ON DELETE SET NULL)');
+        /* cpq_followups column migrations */
+        await c.query("ALTER TABLE cpq_followups ADD COLUMN IF NOT EXISTS next_followup_date DATE DEFAULT NULL").catch(()=>{});
         await c.query('CREATE TABLE IF NOT EXISTS cpq_quote_logs(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(quote_id),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(changed_by) REFERENCES users(id) ON DELETE SET NULL)');
     await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq(
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -2260,7 +2262,7 @@ app.get('/api/cpq/followup-stats', auth, wrap(async(req,res)=>{
   const[pending]=await pool.query(
     `SELECT DISTINCT f.quote_id,f.quote_number,f.customer_name,f.amount,f.currency,f.status,f.created_at
      FROM cpq_followups f
-     WHERE f.status='pending'
+     WHERE f.status NOT IN ('accepted','rejected','cancelled')
      ORDER BY f.created_at DESC LIMIT 10`);
   /* Quotes not followed up in last 7 days (sent quotes only) */
   const[overdue]=await pool.query(
@@ -2268,8 +2270,8 @@ app.get('/api/cpq/followup-stats', auth, wrap(async(req,res)=>{
        MAX(f.created_at) as last_followup
      FROM cpq_quotes q
      LEFT JOIN cpq_followups f ON q.id=f.quote_id
-     WHERE q.status IN ('sent','draft')
-     GROUP BY q.id
+     WHERE q.status IN ('sent','draft','accepted')
+     GROUP BY q.id,q.quote_number,q.customer_name,q.total,q.currency,q.status,q.quote_date
      HAVING last_followup IS NULL OR last_followup < DATE_SUB(NOW(), INTERVAL 7 DAY)
      ORDER BY last_followup ASC LIMIT 10`);
   res.json({pending,overdue});
