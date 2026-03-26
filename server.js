@@ -1792,6 +1792,11 @@ app.post('/api/clients', auth, wrap(async(req,res)=>{
   const[r]=await pool.query(
     'INSERT INTO clients(name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     [name.trim(),country||'United Arab Emirates',city||null,client_type||'company',trn||null,trn_not_registered?1:0,additional_details||null,building_number||null,street_address||null,postal_code||null,email||null,phone||null,contact_person||null,contact_mobile||null,req.user.id]);
+  /* Audit log: creation */
+  await pool.query('INSERT INTO clients_log(client_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
+    [r.insertId,'created',req.user.id,req.user.full_name||req.user.username,
+     JSON.stringify([{field:'Name',old:'—',new:name.trim()},{field:'Type',old:'—',new:client_type||'company'},{field:'Country',old:'—',new:country||'United Arab Emirates'}])
+    ]).catch(()=>{});
   res.json({success:true,id:r.insertId});
 }));
 app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
@@ -1823,6 +1828,13 @@ app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
 app.delete('/api/clients/:id', auth, wrap(async(req,res)=>{
   await pool.query('UPDATE clients SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
+}));
+
+app.get('/api/clients/:id/logs', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query(
+    'SELECT * FROM clients_log WHERE client_id=? ORDER BY created_at DESC',
+    [req.params.id]);
+  res.json(rows);
 }));
 
 /* ══════════════════════════════════════
