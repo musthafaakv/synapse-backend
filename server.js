@@ -456,6 +456,7 @@ async function setupDatabase(){
     if(!existCPQItems.has('sku')){
       await c.query("ALTER TABLE cpq_quote_items ADD COLUMN sku VARCHAR(100) DEFAULT NULL AFTER product_name").catch(e=>console.log('migrate cpq_quote_items sku:',e.message));
     }
+    await c.query('CREATE TABLE IF NOT EXISTS client_contacts(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,name VARCHAR(255) NOT NULL,phone VARCHAR(50) DEFAULT NULL,email VARCHAR(255) DEFAULT NULL,whatsapp VARCHAR(50) DEFAULT NULL,designation VARCHAR(100) DEFAULT NULL,is_primary TINYINT(1) DEFAULT 0,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(client_id),FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE)').catch(()=>{});
     await c.query('CREATE TABLE IF NOT EXISTS cpq_followups(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,quote_number VARCHAR(50),customer_name VARCHAR(255),amount DECIMAL(14,2) DEFAULT 0,currency VARCHAR(10) DEFAULT \'AED\',status VARCHAR(50) DEFAULT \'draft\',next_followup_date DATE DEFAULT NULL,comment TEXT DEFAULT NULL,followed_by INT DEFAULT NULL,followed_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(quote_id),INDEX(next_followup_date),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(followed_by) REFERENCES users(id) ON DELETE SET NULL)');
         /* cpq_followups column migrations */
         /* Safe migration: try adding column, ignore error if exists */
@@ -2195,6 +2196,44 @@ app.get('/api/cpq/quotes/:id/logs', auth, adminOnly, wrap(async(req,res)=>{
     'SELECT l.*,u.username FROM cpq_quote_logs l LEFT JOIN users u ON l.changed_by=u.id WHERE l.quote_id=? ORDER BY l.created_at DESC',
     [req.params.id]);
   res.json(rows);
+}));
+
+/* ══════════════════════════════════════
+   CONTACT PERSONS
+══════════════════════════════════════ */
+app.get('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM client_contacts WHERE client_id=? ORDER BY is_primary DESC,id ASC',[req.params.id]);
+  res.json(rows);
+}));
+
+app.post('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
+  const{name,phone,email,whatsapp,designation,is_primary}=req.body;
+  if(!name||!name.trim()) return res.status(400).json({error:'Name is required'});
+  if(is_primary){
+    await pool.query('UPDATE client_contacts SET is_primary=0 WHERE client_id=?',[req.params.id]);
+  }
+  const[r]=await pool.query(
+    'INSERT INTO client_contacts(client_id,name,phone,email,whatsapp,designation,is_primary) VALUES(?,?,?,?,?,?,?)',
+    [req.params.id,name.trim(),phone||null,email||null,whatsapp||null,designation||null,is_primary?1:0]);
+  res.json({id:r.insertId,success:true});
+}));
+
+app.put('/api/clients/contacts/:cid', auth, wrap(async(req,res)=>{
+  const{name,phone,email,whatsapp,designation,is_primary}=req.body;
+  if(!name||!name.trim()) return res.status(400).json({error:'Name is required'});
+  const[[cc]]=await pool.query('SELECT client_id FROM client_contacts WHERE id=?',[req.params.cid]);
+  if(!cc) return res.status(404).json({error:'Not found'});
+  if(is_primary){
+    await pool.query('UPDATE client_contacts SET is_primary=0 WHERE client_id=?',[cc.client_id]);
+  }
+  await pool.query('UPDATE client_contacts SET name=?,phone=?,email=?,whatsapp=?,designation=?,is_primary=? WHERE id=?',
+    [name.trim(),phone||null,email||null,whatsapp||null,designation||null,is_primary?1:0,req.params.cid]);
+  res.json({success:true});
+}));
+
+app.delete('/api/clients/contacts/:cid', auth, wrap(async(req,res)=>{
+  await pool.query('DELETE FROM client_contacts WHERE id=?',[req.params.cid]);
+  res.json({success:true});
 }));
 
 /* ══════════════════════════════════════
