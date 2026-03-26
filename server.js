@@ -2218,7 +2218,7 @@ app.post('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
   res.json({id:r.insertId,success:true});
 }));
 
-app.put('/api/clients/contacts/:cid', auth, wrap(async(req,res)=>{
+app.put('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
   const{name,phone,email,whatsapp,designation,is_primary}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Name is required'});
   const[[cc]]=await pool.query('SELECT client_id FROM client_contacts WHERE id=?',[req.params.cid]);
@@ -2231,7 +2231,7 @@ app.put('/api/clients/contacts/:cid', auth, wrap(async(req,res)=>{
   res.json({success:true});
 }));
 
-app.delete('/api/clients/contacts/:cid', auth, wrap(async(req,res)=>{
+app.delete('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
   await pool.query('DELETE FROM client_contacts WHERE id=?',[req.params.cid]);
   res.json({success:true});
 }));
