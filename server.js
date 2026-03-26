@@ -456,7 +456,12 @@ async function setupDatabase(){
     if(!existCPQItems.has('sku')){
       await c.query("ALTER TABLE cpq_quote_items ADD COLUMN sku VARCHAR(100) DEFAULT NULL AFTER product_name").catch(e=>console.log('migrate cpq_quote_items sku:',e.message));
     }
-    await c.query('CREATE TABLE IF NOT EXISTS client_contacts(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,name VARCHAR(255) NOT NULL,phone VARCHAR(50) DEFAULT NULL,email VARCHAR(255) DEFAULT NULL,whatsapp VARCHAR(50) DEFAULT NULL,designation VARCHAR(100) DEFAULT NULL,is_primary TINYINT(1) DEFAULT 0,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(client_id),FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS client_contacts(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,name VARCHAR(255) NOT NULL,phone VARCHAR(50) DEFAULT NULL,email VARCHAR(255) DEFAULT NULL,whatsapp VARCHAR(50) DEFAULT NULL,designation VARCHAR(100) DEFAULT NULL,is_primary TINYINT(1) DEFAULT 0,added_by INT DEFAULT NULL,added_by_name VARCHAR(255) DEFAULT NULL,updated_by INT DEFAULT NULL,updated_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(client_id),FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE,FOREIGN KEY(added_by) REFERENCES users(id) ON DELETE SET NULL,FOREIGN KEY(updated_by) REFERENCES users(id) ON DELETE SET NULL)').catch(()=>{});
+    /* client_contacts log field migrations */
+    await c.query('ALTER TABLE client_contacts ADD COLUMN added_by INT DEFAULT NULL').catch(()=>{});
+    await c.query('ALTER TABLE client_contacts ADD COLUMN added_by_name VARCHAR(255) DEFAULT NULL').catch(()=>{});
+    await c.query('ALTER TABLE client_contacts ADD COLUMN updated_by INT DEFAULT NULL').catch(()=>{});
+    await c.query('ALTER TABLE client_contacts ADD COLUMN updated_by_name VARCHAR(255) DEFAULT NULL').catch(()=>{});
     await c.query('CREATE TABLE IF NOT EXISTS cpq_followups(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,quote_number VARCHAR(50),customer_name VARCHAR(255),amount DECIMAL(14,2) DEFAULT 0,currency VARCHAR(10) DEFAULT \'AED\',status VARCHAR(50) DEFAULT \'draft\',next_followup_date DATE DEFAULT NULL,comment TEXT DEFAULT NULL,followed_by INT DEFAULT NULL,followed_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(quote_id),INDEX(next_followup_date),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(followed_by) REFERENCES users(id) ON DELETE SET NULL)');
         /* cpq_followups column migrations */
         /* Safe migration: try adding column, ignore error if exists */
@@ -2213,8 +2218,9 @@ app.post('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
     await pool.query('UPDATE client_contacts SET is_primary=0 WHERE client_id=?',[req.params.id]);
   }
   const[r]=await pool.query(
-    'INSERT INTO client_contacts(client_id,name,phone,email,whatsapp,designation,is_primary) VALUES(?,?,?,?,?,?,?)',
-    [req.params.id,name.trim(),phone||null,email||null,whatsapp||null,designation||null,is_primary?1:0]);
+    'INSERT INTO client_contacts(client_id,name,phone,email,whatsapp,designation,is_primary,added_by,added_by_name,updated_by,updated_by_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+    [req.params.id,name.trim(),phone||null,email||null,whatsapp||null,designation||null,is_primary?1:0,
+     req.user.id,req.user.full_name||req.user.username,req.user.id,req.user.full_name||req.user.username]);
   res.json({id:r.insertId,success:true});
 }));
 
@@ -2226,8 +2232,9 @@ app.put('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
   if(is_primary){
     await pool.query('UPDATE client_contacts SET is_primary=0 WHERE client_id=?',[cc.client_id]);
   }
-  await pool.query('UPDATE client_contacts SET name=?,phone=?,email=?,whatsapp=?,designation=?,is_primary=? WHERE id=?',
-    [name.trim(),phone||null,email||null,whatsapp||null,designation||null,is_primary?1:0,req.params.cid]);
+  await pool.query('UPDATE client_contacts SET name=?,phone=?,email=?,whatsapp=?,designation=?,is_primary=?,updated_by=?,updated_by_name=? WHERE id=?',
+    [name.trim(),phone||null,email||null,whatsapp||null,designation||null,is_primary?1:0,
+     req.user.id,req.user.full_name||req.user.username,req.params.cid]);
   res.json({success:true});
 }));
 
