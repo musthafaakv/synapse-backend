@@ -1825,7 +1825,7 @@ app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
   res.json({success:true});
 }));
 
-app.delete('/api/clients/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/clients/:id', auth, adminOnly, wrap(async(req,res)=>{
   await pool.query('UPDATE clients SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
