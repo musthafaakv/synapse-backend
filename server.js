@@ -457,6 +457,8 @@ async function setupDatabase(){
       await c.query("ALTER TABLE cpq_quote_items ADD COLUMN sku VARCHAR(100) DEFAULT NULL AFTER product_name").catch(e=>console.log('migrate cpq_quote_items sku:',e.message));
     }
     await c.query('CREATE TABLE IF NOT EXISTS client_contacts(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,name VARCHAR(255) NOT NULL,phone VARCHAR(50) DEFAULT NULL,email VARCHAR(255) DEFAULT NULL,whatsapp VARCHAR(50) DEFAULT NULL,designation VARCHAR(100) DEFAULT NULL,is_primary TINYINT(1) DEFAULT 0,added_by INT DEFAULT NULL,added_by_name VARCHAR(255) DEFAULT NULL,updated_by INT DEFAULT NULL,updated_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(client_id),FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE,FOREIGN KEY(added_by) REFERENCES users(id) ON DELETE SET NULL,FOREIGN KEY(updated_by) REFERENCES users(id) ON DELETE SET NULL)').catch(()=>{});
+    /* client_contact_logs table */
+    await c.query('CREATE TABLE IF NOT EXISTS client_contact_logs(id INT AUTO_INCREMENT PRIMARY KEY,contact_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(contact_id),FOREIGN KEY(contact_id) REFERENCES client_contacts(id) ON DELETE CASCADE)').catch(()=>{});
     /* client_contacts log field migrations */
     await c.query('ALTER TABLE client_contacts ADD COLUMN added_by INT DEFAULT NULL').catch(()=>{});
     await c.query('ALTER TABLE client_contacts ADD COLUMN added_by_name VARCHAR(255) DEFAULT NULL').catch(()=>{});
@@ -2221,7 +2223,12 @@ app.post('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
     'INSERT INTO client_contacts(client_id,name,phone,email,whatsapp,designation,is_primary,added_by,added_by_name,updated_by,updated_by_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
     [req.params.id,name.trim(),phone||null,email||null,whatsapp||null,designation||null,is_primary?1:0,
      req.user.id,req.user.full_name||req.user.username,req.user.id,req.user.full_name||req.user.username]);
-  res.json({id:r.insertId,success:true});
+  const cid=r.insertId;
+  /* Log creation */
+  const createLog={name:name.trim(),phone:phone||null,email:email||null,whatsapp:whatsapp||null,designation:designation||null,is_primary:is_primary?1:0};
+  await pool.query('INSERT INTO client_contact_logs(contact_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
+    [cid,'created',req.user.id,req.user.full_name||req.user.username,JSON.stringify([{field:'Contact',old:'—',new:name.trim()},{field:'Designation',old:'—',new:designation||'—'},{field:'Phone',old:'—',new:phone||'—'}])]).catch(()=>{});
+  res.json({id:cid,success:true});
 }));
 
 app.put('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
@@ -2232,10 +2239,31 @@ app.put('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
   if(is_primary){
     await pool.query('UPDATE client_contacts SET is_primary=0 WHERE client_id=?',[cc.client_id]);
   }
+  /* Fetch old values for diff */
+  const[[oldC]]=await pool.query('SELECT * FROM client_contacts WHERE id=?',[req.params.cid]);
   await pool.query('UPDATE client_contacts SET name=?,phone=?,email=?,whatsapp=?,designation=?,is_primary=?,updated_by=?,updated_by_name=? WHERE id=?',
     [name.trim(),phone||null,email||null,whatsapp||null,designation||null,is_primary?1:0,
      req.user.id,req.user.full_name||req.user.username,req.params.cid]);
+  /* Build diff log */
+  if(oldC){
+    const diffs=[];
+    const fields=[['name','Name'],['phone','Phone'],['email','Email'],['whatsapp','WhatsApp'],['designation','Designation'],['is_primary','Primary']];
+    for(const[k,label] of fields){
+      const ov=String(oldC[k]||'');
+      const nv=String((k==='name'?name:k==='phone'?phone:k==='email'?email:k==='whatsapp'?whatsapp:k==='designation'?designation:is_primary)||'');
+      if(ov!==nv) diffs.push({field:label,old:ov||'—',new:nv||'—'});
+    }
+    if(diffs.length){
+      await pool.query('INSERT INTO client_contact_logs(contact_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
+        [req.params.cid,'updated',req.user.id,req.user.full_name||req.user.username,JSON.stringify(diffs)]).catch(()=>{});
+    }
+  }
   res.json({success:true});
+}));
+
+app.get('/api/clients/contacts/:cid/logs', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM client_contact_logs WHERE contact_id=? ORDER BY created_at DESC',[req.params.cid]);
+  res.json(rows);
 }));
 
 app.delete('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
