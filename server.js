@@ -459,6 +459,8 @@ async function setupDatabase(){
     await c.query('CREATE TABLE IF NOT EXISTS client_contacts(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,name VARCHAR(255) NOT NULL,phone VARCHAR(50) DEFAULT NULL,email VARCHAR(255) DEFAULT NULL,whatsapp VARCHAR(50) DEFAULT NULL,designation VARCHAR(100) DEFAULT NULL,is_primary TINYINT(1) DEFAULT 0,added_by INT DEFAULT NULL,added_by_name VARCHAR(255) DEFAULT NULL,updated_by INT DEFAULT NULL,updated_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(client_id),FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE,FOREIGN KEY(added_by) REFERENCES users(id) ON DELETE SET NULL,FOREIGN KEY(updated_by) REFERENCES users(id) ON DELETE SET NULL)').catch(()=>{});
     /* client_contact_logs table */
     await c.query('CREATE TABLE IF NOT EXISTS client_contact_logs(id INT AUTO_INCREMENT PRIMARY KEY,contact_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(contact_id),FOREIGN KEY(contact_id) REFERENCES client_contacts(id) ON DELETE CASCADE)').catch(()=>{});
+    /* clients audit log */
+    await c.query('CREATE TABLE IF NOT EXISTS clients_log(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(client_id))').catch(()=>{});
     /* client_contacts log field migrations */
     await c.query('ALTER TABLE client_contacts ADD COLUMN added_by INT DEFAULT NULL').catch(()=>{});
     await c.query('ALTER TABLE client_contacts ADD COLUMN added_by_name VARCHAR(255) DEFAULT NULL').catch(()=>{});
@@ -1798,13 +1800,26 @@ app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
   if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
     return res.status(400).json({error:'VAT/TRN must be exactly 15 digits'});
   }
+  /* Fetch old values for diff BEFORE update */
+  const[[oldCl]]=await pool.query('SELECT * FROM clients WHERE id=?',[req.params.id]).catch(()=>[[null]]);
   await pool.query(
     'UPDATE clients SET name=?,country=?,city=?,client_type=?,trn=?,trn_not_registered=?,additional_details=?,building_number=?,street_address=?,postal_code=?,email=?,phone=?,contact_person=?,contact_mobile=?,updated_at=NOW() WHERE id=?',
     [name.trim(),country||'United Arab Emirates',city||null,client_type||'company',trn||null,trn_not_registered?1:0,additional_details||null,building_number||null,street_address||null,postal_code||null,email||null,phone||null,contact_person||null,contact_mobile||null,req.params.id]);
+  /* Log changes */
+  if(oldCl){
+    const clDiffs=[];
+    const clFields=[['name','Business Name'],['country','Country'],['city','City'],['client_type','Type'],['trn','VAT/TRN'],['email','Email'],['phone','Phone'],['additional_details','Notes']];
+    for(const[k,label] of clFields){
+      const ov=String(oldCl[k]||'');
+      const nv=String((k==='name'?name:k==='country'?country:k==='city'?city:k==='client_type'?client_type:k==='trn'?trn:k==='email'?email:k==='phone'?phone:additional_details)||'');
+      if(ov!==nv) clDiffs.push({field:label,old:ov||'—',new:nv||'—'});
+    }
+    if(clDiffs.length) await pool.query('INSERT INTO clients_log(client_id,action,changed_by,changed_by_name,changes) VALUES(?,?,?,?,?)',
+      [req.params.id,'updated',req.user.id,req.user.full_name||req.user.username,JSON.stringify(clDiffs)]).catch(()=>{});
+  }
   res.json({success:true});
 }));
 
-/* Soft-delete client */
 app.delete('/api/clients/:id', auth, wrap(async(req,res)=>{
   await pool.query('UPDATE clients SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
