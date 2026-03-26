@@ -469,7 +469,7 @@ async function setupDatabase(){
         /* Safe migration: try adding column, ignore error if exists */
         await c.query('ALTER TABLE cpq_followups ADD COLUMN next_followup_date DATE DEFAULT NULL').catch(()=>{});
         await c.query("ALTER TABLE cpq_followups MODIFY COLUMN status VARCHAR(50) DEFAULT 'draft'").catch(()=>{});
-        await c.query('CREATE TABLE IF NOT EXISTS cpq_quote_logs(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(quote_id),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(changed_by) REFERENCES users(id) ON DELETE SET NULL)');
+        await c.query('CREATE TABLE IF NOT EXISTS cpq_quote_logs(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(quote_id),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(changed_by) REFERENCES users(id) ON DELETE SET NULL)').catch(()=>{});
     await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq(
       id INT AUTO_INCREMENT PRIMARY KEY,
       boq_number VARCHAR(50) NOT NULL UNIQUE,
