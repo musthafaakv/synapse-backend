@@ -711,10 +711,7 @@ const auth = async(req,res,next)=>{
     const t = req.headers.authorization?.split(' ')[1];
     if(!t) return res.status(401).json({error:'No token'});
     req.user = jwt.verify(t,JWT_SECRET);
-    if(req.user.role==='supervisor'){
-      const[perms]=await pool.query('SELECT * FROM supervisor_permissions WHERE user_id=?',[req.user.id]);
-      req.user.permissions = perms[0]||{};
-    }
+
     /* Attach group_id for permission lookups */
     if(!req.user.group_id){
       const[[u]]=await pool.query('SELECT group_id FROM users WHERE id=?',[req.user.id]).catch(()=>[[null]]);
@@ -755,7 +752,7 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
   if(!await bcrypt.compare(password,u.password_hash)) return res.status(401).json({error:'Invalid credentials'});
   const token=jwt.sign({id:u.id,username:u.username,role:u.role},JWT_SECRET,{expiresIn:'8h'});
   let permissions={};
-  if(u.role==='supervisor'){const[perms]=await pool.query('SELECT * FROM supervisor_permissions WHERE user_id=?',[u.id]);permissions=perms[0]||{};}
+
   // Capture real client IP (behind proxies)
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
            || req.headers['x-real-ip']
@@ -775,17 +772,12 @@ app.get('/api/users', auth, wrap(async(req,res)=>{
       u.avatar_color,u.is_active,u.must_change_password,u.last_login_at,u.last_login_ip,u.created_at,
       u.schedule_id,u.group_id,
       pg.name as group_name,pg.color as group_color,
-      sp.can_approve_attendance,sp.can_view_all_attendance,sp.can_edit_tasks,
-      sp.can_create_tasks,sp.can_view_all_tasks,sp.can_manage_holidays
     FROM users u
-    LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id
     LEFT JOIN permission_groups pg ON u.group_id=pg.id
     ORDER BY u.full_name`).catch(()=>{
       /* Fallback without group join if table doesn't exist yet */
       return pool.query(`SELECT u.*,
-        sp.can_approve_attendance,sp.can_view_all_attendance,sp.can_edit_tasks,
-        sp.can_create_tasks,sp.can_view_all_tasks,sp.can_manage_holidays
-        FROM users u LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id
+        FROM users u
         ORDER BY u.full_name`).then(r=>r[0]);
     });
   if(!rows) return res.status(500).json({error:'Failed to fetch users'});
@@ -803,7 +795,6 @@ app.post('/api/users', auth, adminOnly, wrap(async(req,res)=>{
   const color=colors[Math.floor(Math.random()*colors.length)];
   const[r]=await pool.query('INSERT INTO users(username,email,password_hash,full_name,role,employee_category,department,avatar_color,schedule_id,group_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
     [username,email||'',hash,full_name||username,effectiveRole,employee_category||'office',department||'',color,newSchedId||null,group_id||null]);
-  if(role==='supervisor') await pool.query('INSERT IGNORE INTO supervisor_permissions(user_id) VALUES(?)',[r.insertId]);
   res.json({id:r.insertId,username,email,full_name,role:role||'member',employee_category:employee_category||'office',department:department||'',avatar_color:color});
 }));
 
@@ -836,17 +827,7 @@ app.put('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
   }
   if(u.length){v.push(uid);await pool.query(`UPDATE users SET ${u.join(',')} WHERE id=?`,v);}
   if(role==='supervisor'||permissions){
-    const[ex]=await pool.query('SELECT user_id FROM supervisor_permissions WHERE user_id=?',[uid]);
-    if(!ex.length) await pool.query('INSERT INTO supervisor_permissions(user_id) VALUES(?)',[uid]);
-    if(permissions){
-      const pu=[],pv=[];
-      for(const f of ['can_approve_attendance','can_view_all_attendance','can_edit_tasks','can_create_tasks','can_view_all_tasks','can_manage_holidays']){
-        if(permissions[f]!==undefined){pu.push(`${f}=?`);pv.push(permissions[f]?1:0);}
       }
-      if(pu.length){pv.push(uid);await pool.query(`UPDATE supervisor_permissions SET ${pu.join(',')} WHERE user_id=?`,pv);}
-    }
-  }
-  if(role&&role!=='supervisor') await pool.query('DELETE FROM supervisor_permissions WHERE user_id=?',[uid]);
   res.json({success:true});
 }));
 
@@ -939,7 +920,7 @@ app.post('/api/tasks', auth, wrap(async(req,res)=>{
 
 app.put('/api/tasks/:id', auth, wrap(async(req,res)=>{
   const isAdmin=req.user.role==='admin';
-  const canEdit=isAdmin||(req.user.role==='supervisor'&&req.user.permissions?.can_edit_tasks);
+  const canEdit=isAdmin||req.user.role==='supervisor'||req.user.role==='member';
   if(!canEdit) return res.status(403).json({error:'Only admins and authorised supervisors can fully edit tasks'});
   const{title,description,status,priority,assignee_ids,due_date}=req.body;
   const taskId=req.params.id;
@@ -1211,7 +1192,6 @@ app.get('/api/attendance/my', auth, wrap(async(req,res)=>{
 
 /* Admin: Per-user daily report (staff report grid) */
 app.get('/api/admin/attendance/report', auth, adminOrSupervisor, wrap(async(req,res)=>{
-  if(req.user.role==='supervisor'&&!req.user.permissions?.can_view_all_attendance) return res.status(403).json({error:'Permission denied'});
   const{year,month}=req.query;
   const y=parseInt(year)||new Date().getFullYear(),m=parseInt(month)||new Date().getMonth()+1;
   const startDate=`${y}-${String(m).padStart(2,'0')}-01`,lastD=new Date(y,m,0).getDate();
@@ -1275,7 +1255,6 @@ app.get('/api/admin/attendance/report', auth, adminOrSupervisor, wrap(async(req,
 
 /* Admin: all attendance records */
 app.get('/api/admin/attendance', auth, adminOrSupervisor, wrap(async(req,res)=>{
-  if(req.user.role==='supervisor'&&!req.user.permissions?.can_view_all_attendance) return res.status(403).json({error:'Permission denied'});
   const{year,month,user_id,status,category}=req.query;
   const y=parseInt(year)||new Date().getFullYear(),m=parseInt(month)||new Date().getMonth()+1;
   const startDate=`${y}-${String(m).padStart(2,'0')}-01`,lastD=new Date(y,m,0).getDate();
@@ -1313,7 +1292,6 @@ app.get('/api/admin/attendance', auth, adminOrSupervisor, wrap(async(req,res)=>{
 }));
 
 app.put('/api/admin/attendance/:id', auth, adminOrSupervisor, wrap(async(req,res)=>{
-  if(req.user.role==='supervisor'&&!req.user.permissions?.can_approve_attendance) return res.status(403).json({error:'Permission denied'});
   const{clock_in_status,clock_out_status,approved_clock_in,approved_clock_out,admin_note}=req.body;
   const id=req.params.id;
   const[rows]=await pool.query('SELECT * FROM attendance WHERE id=?',[id]);
@@ -1366,7 +1344,6 @@ app.put('/api/admin/attendance/:id', auth, adminOrSupervisor, wrap(async(req,res
 }));
 
 app.post('/api/admin/attendance/bulk-approve', auth, adminOrSupervisor, wrap(async(req,res)=>{
-  if(req.user.role==='supervisor'&&!req.user.permissions?.can_approve_attendance) return res.status(403).json({error:'Permission denied'});
   const{ids}=req.body;
   if(!Array.isArray(ids)||!ids.length) return res.status(400).json({error:'No IDs'});
   await pool.query(`UPDATE attendance SET clock_in_status='approved',approved_by=?,approved_at=NOW(),approved_clock_in=COALESCE(approved_clock_in,clock_in),approved_clock_out=COALESCE(approved_clock_out,clock_out) WHERE id IN(${ids.map(()=>'?').join(',')}) AND clock_in_status='pending'`,[req.user.id,...ids]);
@@ -1375,7 +1352,6 @@ app.post('/api/admin/attendance/bulk-approve', auth, adminOrSupervisor, wrap(asy
 
 /* Admin attendance stats — comprehensive with category breakdown */
 app.get('/api/admin/attendance/stats', auth, adminOrSupervisor, wrap(async(req,res)=>{
-  if(req.user.role==='supervisor'&&!req.user.permissions?.can_view_all_attendance) return res.status(403).json({error:'Permission denied'});
   const{year,month}=req.query;
   const y=parseInt(year)||new Date().getFullYear(),m=parseInt(month)||new Date().getMonth()+1;
   const startDate=`${y}-${String(m).padStart(2,'0')}-01`,lastD=new Date(y,m,0).getDate();
