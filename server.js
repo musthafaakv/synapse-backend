@@ -461,6 +461,29 @@ async function setupDatabase(){
     await c.query('CREATE TABLE IF NOT EXISTS client_contact_logs(id INT AUTO_INCREMENT PRIMARY KEY,contact_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(contact_id),FOREIGN KEY(contact_id) REFERENCES client_contacts(id) ON DELETE CASCADE)').catch(()=>{});
     /* clients audit log */
     await c.query('CREATE TABLE IF NOT EXISTS clients_log(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(client_id))').catch(()=>{});
+    /* Security / Permissions tables */
+    await c.query('CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,key VARCHAR(50) NOT NULL UNIQUE,description VARCHAR(255) DEFAULT NULL,sort_order INT DEFAULT 0)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS permission_groups(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,role_key VARCHAR(50) DEFAULT NULL,description VARCHAR(255) DEFAULT NULL,color VARCHAR(20) DEFAULT \'#6b7280\',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0,UNIQUE KEY uq_gm(group_id,module_id),FOREIGN KEY(group_id) REFERENCES permission_groups(id) ON DELETE CASCADE,FOREIGN KEY(module_id) REFERENCES permission_modules(id) ON DELETE CASCADE)').catch(()=>{});
+    /* Seed modules */
+    const mods=[['Customers','customers','Customer records management',1],['Contact Persons','contacts','Customer contact persons',2],['Quotes (CPQ)','quotes','Quotations and pricing',3],['Quote Follow-Up','followup','Follow-up tracking',4],['Products','products','Product catalog',5],['Suppliers','suppliers','Supplier management',6],['Delivery Notes','delivery_notes','Delivery note management',7],['BOQ','boq','Bill of Quantities',8],['Attendance','attendance','Attendance tracking',9],['Tasks','tasks','Task management',10],['Admin Panel','admin','Admin settings',11]];
+    for(const[name,key,desc,ord] of mods){
+      await c.query('INSERT IGNORE INTO permission_modules(name,key,description,sort_order) VALUES(?,?,?,?)',[name,key,desc,ord]).catch(()=>{});
+    }
+    /* Seed default groups */
+    const defaultGroups=[['Master Admin','admin','Full access to all modules','#dc2626'],['Supervisor','supervisor','View, create and edit access','#7c3aed'],['User','member','View and create access','#0ea5e9']];
+    for(const[name,role_key,desc,color] of defaultGroups){
+      await c.query('INSERT IGNORE INTO permission_groups(name,role_key,description,color) VALUES(?,?,?,?)',[name,role_key,desc,color]).catch(()=>{});
+    }
+    /* Seed admin full permissions */
+    await c.query(`INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete)
+      SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key='admin'`).catch(()=>{});
+    /* Seed supervisor permissions (view+create+edit) */
+    await c.query(`INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete)
+      SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key='supervisor'`).catch(()=>{});
+    /* Seed user permissions (view+create) */
+    await c.query(`INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete)
+      SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key='member'`).catch(()=>{});
     /* client_contacts log field migrations */
     await c.query('ALTER TABLE client_contacts ADD COLUMN added_by INT DEFAULT NULL').catch(()=>{});
     await c.query('ALTER TABLE client_contacts ADD COLUMN added_by_name VARCHAR(255) DEFAULT NULL').catch(()=>{});
@@ -1835,6 +1858,66 @@ app.get('/api/clients/:id/logs', auth, wrap(async(req,res)=>{
     'SELECT * FROM clients_log WHERE client_id=? ORDER BY created_at DESC',
     [req.params.id]);
   res.json(rows);
+}));
+
+/* ══════════════════════════════════════
+   SECURITY / PERMISSIONS
+══════════════════════════════════════ */
+
+/* GET all groups with their permissions */
+app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
+  const[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id');
+  const[perms]=await pool.query('SELECT * FROM group_permissions');
+  const[modules]=await pool.query('SELECT * FROM permission_modules ORDER BY sort_order,name');
+  res.json({groups,perms,modules});
+}));
+
+/* POST create group */
+app.post('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
+  const{name,description,color}=req.body;
+  if(!name||!name.trim()) return res.status(400).json({error:'Name required'});
+  const[r]=await pool.query('INSERT INTO permission_groups(name,description,color) VALUES(?,?,?)',[name.trim(),description||null,color||'#6b7280']);
+  res.json({id:r.insertId,success:true});
+}));
+
+/* PUT update group */
+app.put('/api/security/groups/:id', auth, adminOnly, wrap(async(req,res)=>{
+  const{name,description,color}=req.body;
+  await pool.query('UPDATE permission_groups SET name=?,description=?,color=? WHERE id=?',[name.trim(),description||null,color||'#6b7280',req.params.id]);
+  res.json({success:true});
+}));
+
+/* DELETE group */
+app.delete('/api/security/groups/:id', auth, adminOnly, wrap(async(req,res)=>{
+  await pool.query('DELETE FROM permission_groups WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
+
+/* POST save permissions for a group (bulk upsert) */
+app.post('/api/security/groups/:id/permissions', auth, adminOnly, wrap(async(req,res)=>{
+  const{permissions}=req.body; /* [{module_id, can_view, can_create, can_edit, can_delete}] */
+  if(!Array.isArray(permissions)) return res.status(400).json({error:'permissions array required'});
+  await pool.query('DELETE FROM group_permissions WHERE group_id=?',[req.params.id]);
+  if(permissions.length){
+    const vals=permissions.map(p=>[req.params.id,p.module_id,p.can_view?1:0,p.can_create?1:0,p.can_edit?1:0,p.can_delete?1:0]);
+    await pool.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) VALUES ?',[vals]);
+  }
+  res.json({success:true});
+}));
+
+/* GET my permissions (for current user role) */
+app.get('/api/security/my-permissions', auth, wrap(async(req,res)=>{
+  const role=req.user.role||'member';
+  const[[group]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[role]);
+  if(!group) return res.json({});
+  const[perms]=await pool.query(`
+    SELECT m.key,gp.can_view,gp.can_create,gp.can_edit,gp.can_delete
+    FROM group_permissions gp
+    JOIN permission_modules m ON gp.module_id=m.id
+    WHERE gp.group_id=?`,[group.id]);
+  const result={};
+  perms.forEach(p=>{result[p.key]={view:!!p.can_view,create:!!p.can_create,edit:!!p.can_edit,delete:!!p.can_delete};});
+  res.json(result);
 }));
 
 /* ══════════════════════════════════════
