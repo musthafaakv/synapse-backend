@@ -467,8 +467,10 @@ async function setupDatabase(){
     await c.query('CREATE TABLE IF NOT EXISTS departments(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,is_active TINYINT(1) DEFAULT 1,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
     /* Seed default departments */
     await c.query("INSERT IGNORE INTO departments(id,name) VALUES(1,'Management'),(2,'Sales'),(3,'Operations'),(4,'Finance'),(5,'IT')").catch(()=>{});
-    /Security tables */
+    /* Security tables */
     await c.query('CREATE TABLE IF NOT EXISTS permission_modules (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, pkey VARCHAR(50) NOT NULL, sort_order INT DEFAULT 0)').catch(()=>{});
+    /* Migrate: rename old `key` column to `pkey` if it exists */
+    await c.query("ALTER TABLE permission_modules CHANGE COLUMN `key` pkey VARCHAR(50) NOT NULL").catch(()=>{});
     await c.query('CREATE TABLE IF NOT EXISTS permission_groups (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, role_key VARCHAR(50), color VARCHAR(20) DEFAULT \'#6b7280\', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
     await c.query('CREATE TABLE IF NOT EXISTS group_permissions (id INT AUTO_INCREMENT PRIMARY KEY, group_id INT NOT NULL, module_id INT NOT NULL, can_view TINYINT(1) DEFAULT 0, can_create TINYINT(1) DEFAULT 0, can_edit TINYINT(1) DEFAULT 0, can_delete TINYINT(1) DEFAULT 0)').catch(()=>{});
     const _sm=[[1,'Customers','customers',1],[2,'Contact Persons','contacts',2],[3,'Quotes (CPQ)','quotes',3],[4,'Quote Follow-Up','followup',4],[5,'Products','products',5],[6,'Suppliers','suppliers',6],[7,'Delivery Notes','delivery_notes',7],[8,'BOQ','boq',8],[9,'Attendance','attendance',9],[10,'Tasks','tasks',10],[11,'Admin Panel','admin',11]];
@@ -1726,7 +1728,11 @@ app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
   catch(e){console.error('[security/groups] groups query failed:',e.message);}
   try{[perms]=await pool.query('SELECT * FROM group_permissions');}
   catch(e){console.error('[security/groups] perms query failed:',e.message);}
-  try{[modules]=await pool.query('SELECT id, name, pkey as `key`, sort_order FROM permission_modules ORDER BY sort_order,name');}
+  try{
+    /* Try pkey column first, fall back to `key` column for older installs */
+    try{[modules]=await pool.query('SELECT id, name, pkey as `key`, sort_order FROM permission_modules ORDER BY sort_order,name');}
+    catch(e1){[modules]=await pool.query('SELECT id, name, `key`, sort_order FROM permission_modules ORDER BY sort_order,name');}
+  }
   catch(e){console.error('[security/groups] modules query failed:',e.message);}
   const seenG=new Set();const uniqGroups=(groups||[]).filter(g=>{if(seenG.has(g.name))return false;seenG.add(g.name);return true;});
   const seenM=new Set();const uniqModules=(modules||[]).filter(m=>{if(seenM.has(m.key))return false;seenM.add(m.key);return true;});
