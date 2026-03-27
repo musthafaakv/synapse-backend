@@ -789,8 +789,8 @@ app.post('/api/users', auth, adminOnly, wrap(async(req,res)=>{
   const hash=await bcrypt.hash(password,10);
   const colors=['#3B82F6','#10B981','#F59E0B','#8B5CF6','#EC4899','#06B6D4'];
   const color=colors[Math.floor(Math.random()*colors.length)];
-  const[r]=await pool.query('INSERT INTO users(username,email,password_hash,full_name,role,employee_category,department,avatar_color,schedule_id) VALUES(?,?,?,?,?,?,?,?,?)',
-    [username,email||'',hash,full_name||username,role||'member',employee_category||'office',department||'',color,newSchedId||null]);
+  const[r]=await pool.query('INSERT INTO users(username,email,password_hash,full_name,role,employee_category,department,avatar_color,schedule_id,group_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+    [username,email||'',hash,full_name||username,effectiveRole,employee_category||'office',department||'',color,newSchedId||null,group_id||null]);
   if(role==='supervisor') await pool.query('INSERT IGNORE INTO supervisor_permissions(user_id) VALUES(?)',[r.insertId]);
   res.json({id:r.insertId,username,email,full_name,role:role||'member',employee_category:employee_category||'office',department:department||'',avatar_color:color});
 }));
@@ -813,6 +813,15 @@ app.put('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
   if(employee_category!==undefined){u.push('employee_category=?');v.push(employee_category);}
   if(department!==undefined){u.push('department=?');v.push(department);}
   if(schedule_id!==undefined){u.push('schedule_id=?');v.push(schedule_id||null);}
+  const gid=req.body.group_id;
+  if(gid!==undefined){
+    u.push('group_id=?');v.push(gid||null);
+    /* Derive role from group */
+    if(gid){
+      const[[grp]]=await pool.query('SELECT role_key FROM permission_groups WHERE id=?',[gid]).catch(()=>[[null]]);
+      if(grp&&grp.role_key&&role===undefined){u.push('role=?');v.push(grp.role_key);}
+    }
+  }
   if(u.length){v.push(uid);await pool.query(`UPDATE users SET ${u.join(',')} WHERE id=?`,v);}
   if(role==='supervisor'||permissions){
     const[ex]=await pool.query('SELECT user_id FROM supervisor_permissions WHERE user_id=?',[uid]);
