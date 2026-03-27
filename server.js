@@ -615,7 +615,7 @@ app.get('/api/users', auth, wrap(async(req,res)=>{
   res.json(rows||[]);
 }));
 
-app.post('/api/users', auth, adminOnly, wrap(async(req,res)=>{
+app.post('/api/users', auth, adminOnly, requirePerm('admin','create'), wrap(async(req,res)=>{
   const{username,email,password,full_name,role,employee_category,department,schedule_id:newSchedId,group_id}=req.body;
   /* Derive role from group if group_id provided */
   let effectiveRole=role||'member';
@@ -674,7 +674,7 @@ app.get('/api/users/:id', auth, wrap(async(req,res)=>{
   res.json(u);
 }));
 
-app.delete('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
+app.delete('/api/users/:id', auth, adminOnly, requirePerm('admin','delete'), wrap(async(req,res)=>{
   const uid=parseInt(req.params.id);
   if(uid===req.user.id) return res.status(400).json({error:'Cannot delete your own account'});
   await pool.query('DELETE FROM users WHERE id=?',[uid]);
@@ -1659,7 +1659,7 @@ app.get('/api/clients', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(sql,params);
   res.json(rows);
 }));
-app.post('/api/clients', auth, wrap(async(req,res)=>{
+app.post('/api/clients', auth, requirePerm('customers','create'), wrap(async(req,res)=>{
   const{name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile,address}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
   if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
@@ -1675,7 +1675,7 @@ app.post('/api/clients', auth, wrap(async(req,res)=>{
     ]).catch(()=>{});
   res.json({success:true,id:r.insertId});
 }));
-app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
+app.put('/api/clients/:id', auth, requirePerm('customers','edit'), wrap(async(req,res)=>{
   const{name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
   if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
@@ -1978,7 +1978,7 @@ app.get('/api/cpq/products', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query('SELECT p.*,COUNT(pr.id) as price_count FROM cpq_products p LEFT JOIN cpq_prices pr ON p.id=pr.product_id WHERE p.is_active=1 GROUP BY p.id ORDER BY p.category,p.name');
   res.json(rows);
 }));
-app.post('/api/cpq/products', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/products', auth, requirePerm('products','create'), wrap(async(req,res)=>{
   const{name,description,category,sku,unit}=req.body;
   if(!name) return res.status(400).json({error:'Name required'});
   const[r]=await pool.query('INSERT INTO cpq_products(name,description,category,sku,unit,created_by) VALUES(?,?,?,?,?,?)',
@@ -1991,7 +1991,7 @@ app.put('/api/cpq/products/:id', auth, wrap(async(req,res)=>{
     [name,description||null,category||null,sku||null,unit||'pcs',req.params.id]);
   res.json({success:true});
 }));
-app.delete('/api/cpq/products/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/cpq/products/:id', auth, requirePerm('products','delete'), wrap(async(req,res)=>{
   await pool.query('UPDATE cpq_products SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -2007,7 +2007,7 @@ app.get('/api/cpq/suppliers', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query('SELECT s.*,COUNT(pr.id) as product_count FROM cpq_suppliers s LEFT JOIN cpq_prices pr ON s.id=pr.supplier_id WHERE s.is_active=1 GROUP BY s.id ORDER BY s.name');
   res.json(rows);
 }));
-app.post('/api/cpq/suppliers', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/suppliers', auth, requirePerm('suppliers','create'), wrap(async(req,res)=>{
   const{name,contact_name,email,phone,notes}=req.body;
   if(!name) return res.status(400).json({error:'Supplier name required'});
   const[r]=await pool.query('INSERT INTO cpq_suppliers(name,contact_name,email,phone,notes) VALUES(?,?,?,?,?)',
@@ -2020,7 +2020,7 @@ app.put('/api/cpq/suppliers/:id', auth, wrap(async(req,res)=>{
     [name,contact_name||null,email||null,phone||null,notes||null,req.params.id]);
   res.json({success:true});
 }));
-app.delete('/api/cpq/suppliers/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/cpq/suppliers/:id', auth, requirePerm('suppliers','delete'), wrap(async(req,res)=>{
   await pool.query('UPDATE cpq_suppliers SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -2051,7 +2051,7 @@ app.get('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
   const[items]=await pool.query('SELECT * FROM cpq_quote_items WHERE quote_id=? ORDER BY sort_order,id',[req.params.id]);
   res.json({...q,items});
 }));
-app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/quotes', auth, requirePerm('quotes','create'), wrap(async(req,res)=>{
   const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,customer_city,customer_country,contact_person,vat_rate,vat_amount,items,quote_number_override,prepared_by_override}=req.body;
   /* Server-side validation */
   if(!customer_name&&!req.body.customer_id) return res.status(400).json({error:'Customer is required'});
@@ -2083,7 +2083,7 @@ app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
   }
   res.json({success:true,id:qid,quote_number:qnum});
 }));
-app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
+app.put('/api/cpq/quotes/:id', auth, requirePerm('quotes','edit'), wrap(async(req,res)=>{
   /* 14-day lock: only admin can edit after 14 days */
   if(req.user.role!=='admin'){
     const[[lockChk]]=await pool.query('SELECT created_at FROM cpq_quotes WHERE id=?',[req.params.id]);
@@ -2154,7 +2154,7 @@ app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
   }
   res.json({success:true});
 }));
-app.delete('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/cpq/quotes/:id', auth, requirePerm('quotes','delete'), wrap(async(req,res)=>{
   await pool.query('DELETE FROM cpq_quotes WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -2199,7 +2199,7 @@ app.get('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
   }
   res.json({...b,items});
 }));
-app.post('/api/cpq/boq', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/boq', auth, requirePerm('boq','create'), wrap(async(req,res)=>{
   const{title,boq_date,status,customer_id,customer_name,customer_address,notes,currency,total_supplier_cost,total_selling,total_profit,items}=req.body;
   if(!title) return res.status(400).json({error:'Title required'});
   const bnum=await nextBOQNumber();
@@ -2243,7 +2243,7 @@ app.put('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
   }
   res.json({success:true});
 }));
-app.delete('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/cpq/boq/:id', auth, requirePerm('boq','delete'), wrap(async(req,res)=>{
   await pool.query('DELETE FROM cpq_boq WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -2282,7 +2282,7 @@ app.get('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
   res.json(rows);
 }));
 
-app.post('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
+app.post('/api/clients/:id/contacts', auth, requirePerm('contacts','create'), wrap(async(req,res)=>{
   const{name,phone,email,whatsapp,designation,is_primary}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Name is required'});
   if(is_primary){
@@ -2300,7 +2300,7 @@ app.post('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
   res.json({id:cid,success:true});
 }));
 
-app.put('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
+app.put('/api/clients/contacts/:cid', auth, adminOnly, requirePerm('contacts','edit'), wrap(async(req,res)=>{
   const{name,phone,email,whatsapp,designation,is_primary}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Name is required'});
   const[[cc]]=await pool.query('SELECT client_id FROM client_contacts WHERE id=?',[req.params.cid]);
@@ -2335,7 +2335,7 @@ app.get('/api/clients/contacts/:cid/logs', auth, wrap(async(req,res)=>{
   res.json(rows);
 }));
 
-app.delete('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
+app.delete('/api/clients/contacts/:cid', auth, adminOnly, requirePerm('contacts','delete'), wrap(async(req,res)=>{
   await pool.query('DELETE FROM client_contacts WHERE id=?',[req.params.cid]);
   res.json({success:true});
 }));
@@ -2369,7 +2369,7 @@ app.get('/api/cpq/followups/quote/:qid', auth, wrap(async(req,res)=>{
 }));
 
 /* POST create follow-up */
-app.post('/api/cpq/followups', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/followups', auth, requirePerm('followup','create'), wrap(async(req,res)=>{
   const{quote_id,status,next_followup_date,comment}=req.body;
   if(!quote_id) return res.status(400).json({error:'quote_id required'});
   const[[q]]=await pool.query('SELECT quote_number,customer_name,total,currency FROM cpq_quotes WHERE id=?',[quote_id]);
@@ -2396,7 +2396,7 @@ app.put('/api/cpq/followups/:id', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 /* DELETE follow-up (admin only) */
-app.delete('/api/cpq/followups/:id', auth, adminOnly, wrap(async(req,res)=>{
+app.delete('/api/cpq/followups/:id', auth, adminOnly, requirePerm('followup','delete'), wrap(async(req,res)=>{
   await pool.query('DELETE FROM cpq_followups WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -2438,7 +2438,7 @@ app.get('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
   res.json(Object.assign(d,{items}));
 }));
 
-app.post('/api/delivery-notes', auth, wrap(async(req,res)=>{
+app.post('/api/delivery-notes', auth, requirePerm('delivery_notes','create'), wrap(async(req,res)=>{
   const{dn_date,status,client_id,client_name,client_address,client_phone,delivery_person_id,delivery_person_name,notes,items,dn_number_custom}=req.body;
   const dnNum=dn_number_custom||await nextDNNumber();
   const[[dp]]=await pool.query('SELECT full_name FROM users WHERE id=?',[delivery_person_id||req.user.id]);
@@ -2477,7 +2477,7 @@ app.put('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
   res.json({success:true,dn_number:newNum});
 }));
 
-app.delete('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/delivery-notes/:id', auth, requirePerm('delivery_notes','delete'), wrap(async(req,res)=>{
   const[[d]]=await pool.query('SELECT created_by FROM delivery_notes WHERE id=?',[req.params.id]);
   if(!d) return res.status(404).json({error:'Not found'});
   if(req.user.role!=='admin'&&d.created_by!==req.user.id) return res.status(403).json({error:'Forbidden'});
