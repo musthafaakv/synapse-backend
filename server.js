@@ -1898,6 +1898,13 @@ app.post('/api/departments', auth, adminOnly, wrap(async(req,res)=>{
   const[r]=await pool.query('INSERT INTO departments(name) VALUES(?)',[name.trim()]);
   res.json({id:r.insertId,success:true});
 }));
+app.put('/api/departments/:id', auth, adminOnly, wrap(async(req,res)=>{
+  const{name}=req.body;
+  if(!name||!name.trim()) return res.status(400).json({error:'Name required'});
+  await pool.query('UPDATE departments SET name=? WHERE id=?',[name.trim(),req.params.id]);
+  res.json({success:true});
+}));
+
 app.delete('/api/departments/:id', auth, adminOnly, wrap(async(req,res)=>{
   await pool.query('UPDATE departments SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
