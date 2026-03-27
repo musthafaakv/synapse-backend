@@ -116,9 +116,9 @@ function evaluateClockOut(now, category){
    DATABASE SETUP
 ══════════════════════════════════════ */
 async function setupDatabase(){
+  const c = await pool.getConnection();
+  console.log('✅ MySQL connected');
   try{
-    const c = await pool.getConnection();
-    console.log('✅ MySQL connected');
 
     await c.query(`CREATE TABLE IF NOT EXISTS users(
       id INT AUTO_INCREMENT PRIMARY KEY,
