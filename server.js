@@ -470,6 +470,12 @@ async function setupDatabase(){
     /* Security tables */
     await c.query('CREATE TABLE IF NOT EXISTS permission_modules (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, pkey VARCHAR(50) NOT NULL, sort_order INT DEFAULT 0)').catch(()=>{});
     /* Migrate: rename old `key` column to `pkey` if it exists */
+    /* Remove duplicate permission_groups (keep lowest id per name) */
+    await c.query(`DELETE g2 FROM permission_groups g2
+      INNER JOIN permission_groups g1 ON g1.name=g2.name AND g1.id<g2.id`).catch(()=>{});
+    /* Remove duplicate permission_modules (keep lowest id per pkey) */
+    await c.query(`DELETE m2 FROM permission_modules m2
+      INNER JOIN permission_modules m1 ON m1.pkey=m2.pkey AND m1.id<m2.id`).catch(()=>{});
     await c.query("ALTER TABLE permission_modules CHANGE COLUMN `key` pkey VARCHAR(50) NOT NULL").catch(()=>{});
     await c.query('CREATE TABLE IF NOT EXISTS permission_groups (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, role_key VARCHAR(50), color VARCHAR(20) DEFAULT \'#6b7280\', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
     await c.query('CREATE TABLE IF NOT EXISTS group_permissions (id INT AUTO_INCREMENT PRIMARY KEY, group_id INT NOT NULL, module_id INT NOT NULL, can_view TINYINT(1) DEFAULT 0, can_create TINYINT(1) DEFAULT 0, can_edit TINYINT(1) DEFAULT 0, can_delete TINYINT(1) DEFAULT 0)').catch(()=>{});
@@ -1737,7 +1743,10 @@ app.get('/api/security/setup', auth, adminOnly, wrap(async(req,res)=>{
 /* Lightweight groups list for dropdowns - accessible to all auth users */
 app.get('/api/security/groups/list', auth, wrap(async(req,res)=>{
   const[groups]=await pool.query('SELECT id,name,role_key,color FROM permission_groups ORDER BY id').catch(()=>[[]]);
-  res.json(groups||[]);
+  /* Deduplicate by name - keep first occurrence */
+  const seen=new Set();
+  const uniq=(groups||[]).filter(g=>{if(seen.has(g.name))return false;seen.add(g.name);return true;});
+  res.json(uniq);
 }));
 
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
