@@ -1,4 +1,22 @@
-require('dotenv').config();
+  /* Security tables */
+    await c.query('CREATE TABLE IF NOT EXISTS permission_modules (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, pkey VARCHAR(50) NOT NULL, description VARCHAR(255), sort_order INT DEFAULT 0)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS permission_groups (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, role_key VARCHAR(50), description VARCHAR(255), color VARCHAR(20) DEFAULT \'#6b7280\', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS group_permissions (id INT AUTO_INCREMENT PRIMARY KEY, group_id INT NOT NULL, module_id INT NOT NULL, can_view TINYINT(1) DEFAULT 0, can_create TINYINT(1) DEFAULT 0, can_edit TINYINT(1) DEFAULT 0, can_delete TINYINT(1) DEFAULT 0)').catch(()=>{});
+    /* Seed modules - using pkey instead of reserved word key */
+    const secMods = [
+      [1,'Customers','customers',1],[2,'Contact Persons','contacts',2],[3,'Quotes (CPQ)','quotes',3],
+      [4,'Quote Follow-Up','followup',4],[5,'Products','products',5],[6,'Suppliers','suppliers',6],
+      [7,'Delivery Notes','delivery_notes',7],[8,'BOQ','boq',8],[9,'Attendance','attendance',9],
+      [10,'Tasks','tasks',10],[11,'Admin Panel','admin',11]
+    ];
+    for(const [id,name,pkey,ord] of secMods){
+      await c.query('INSERT INTO permission_modules (id,name,pkey,sort_order) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name)',[id,name,pkey,ord]).catch(()=>{});
+    }
+    await c.query("INSERT INTO permission_groups (id,name,role_key,color) VALUES (1,'Master Admin','admin','#dc2626'),(2,'Supervisor','supervisor','#7c3aed'),(3,'User','member','#0ea5e9') ON DUPLICATE KEY UPDATE name=VALUES(name)").catch(()=>{});
+    await c.query('INSERT INTO group_permissions (group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g, permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1,can_create=1,can_edit=1,can_delete=1',['admin']).catch(()=>{});
+    await c.query('INSERT INTO group_permissions (group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g, permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1,can_create=1,can_edit=1',['supervisor']).catch(()=>{});
+    await c.query('INSERT INTO group_permissions (group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,0,0 FROM permission_groups g, permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1,can_create=1',['member']).catch(()=>{});
+    console.log('[setup] Security tables OK');require('dotenv').config();
 
 // Polyfill fetch for Node < 18
 if(!globalThis.fetch){
@@ -467,37 +485,17 @@ async function setupDatabase(){
     await c.query('CREATE TABLE IF NOT EXISTS departments(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,is_active TINYINT(1) DEFAULT 1,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
     /* Seed default departments */
     await c.query("INSERT IGNORE INTO departments(id,name) VALUES(1,'Management'),(2,'Sales'),(3,'Operations'),(4,'Finance'),(5,'IT')").catch(()=>{});
-    /* Security / Permissions tables - MySQL 5.7 safe */
-    await c.query('CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,`key` VARCHAR(50) NOT NULL,description VARCHAR(255) DEFAULT NULL,sort_order INT DEFAULT 0)').catch(e=>console.error('pm create:',e.message));
-    await c.query('CREATE TABLE IF NOT EXISTS permission_groups(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,role_key VARCHAR(50) DEFAULT NULL,description VARCHAR(255) DEFAULT NULL,color VARCHAR(20) DEFAULT \'#6b7280\',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(e=>console.error('pg create:',e.message));
-    await c.query('CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0)').catch(e=>console.error('gp create:',e.message));
-    /* Seed security data safely */
-    try{
-      /* Seed modules using INSERT IGNORE on key column */
-      const mods=[
-        [1,'Customers','customers',1],[2,'Contact Persons','contacts',2],
-        [3,'Quotes (CPQ)','quotes',3],[4,'Quote Follow-Up','followup',4],
-        [5,'Products','products',5],[6,'Suppliers','suppliers',6],
-        [7,'Delivery Notes','delivery_notes',7],[8,'BOQ','boq',8],
-        [9,'Attendance','attendance',9],[10,'Tasks','tasks',10],[11,'Admin Panel','admin',11]
-      ];
-      for(const[id,name,key,ord] of mods){
-        await c.query('INSERT INTO permission_modules(id,name,`key`,sort_order) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),sort_order=VALUES(sort_order)',[id,name,key,ord]).catch(()=>{});
-      }
-      /* Seed groups */
-      const groups=[[1,'Master Admin','admin','#dc2626'],[2,'Supervisor','supervisor','#7c3aed'],[3,'User','member','#0ea5e9']];
-      for(const[id,name,role_key,color] of groups){
-        await c.query('INSERT INTO permission_groups(id,name,role_key,color) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),role_key=VALUES(role_key),color=VALUES(color)',[id,name,role_key,color]).catch(()=>{});
-      }
-      /* Seed permissions for admin group (full access) */
-      await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT 1,id,1,1,1,1 FROM permission_modules ON DUPLICATE KEY UPDATE can_view=1,can_create=1,can_edit=1,can_delete=1').catch(()=>{});
-      /* Seed permissions for supervisor group (no delete) */
-      await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT 2,id,1,1,1,0 FROM permission_modules ON DUPLICATE KEY UPDATE can_view=1,can_create=1,can_edit=1').catch(()=>{});
-      /* Seed permissions for user group (view+create only) */
-      await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT 3,id,1,1,0,0 FROM permission_modules ON DUPLICATE KEY UPDATE can_view=1,can_create=1').catch(()=>{});
-      console.log('[setup] Security tables seeded OK');
-    }catch(e){console.error('[setup] Security seed failed:',e.message);}
-  }catch(err){
+    /Security tables */
+    await c.query('CREATE TABLE IF NOT EXISTS permission_modules (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, pkey VARCHAR(50) NOT NULL, sort_order INT DEFAULT 0)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS permission_groups (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, role_key VARCHAR(50), color VARCHAR(20) DEFAULT \'#6b7280\', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS group_permissions (id INT AUTO_INCREMENT PRIMARY KEY, group_id INT NOT NULL, module_id INT NOT NULL, can_view TINYINT(1) DEFAULT 0, can_create TINYINT(1) DEFAULT 0, can_edit TINYINT(1) DEFAULT 0, can_delete TINYINT(1) DEFAULT 0)').catch(()=>{});
+    const _sm=[[1,'Customers','customers',1],[2,'Contact Persons','contacts',2],[3,'Quotes (CPQ)','quotes',3],[4,'Quote Follow-Up','followup',4],[5,'Products','products',5],[6,'Suppliers','suppliers',6],[7,'Delivery Notes','delivery_notes',7],[8,'BOQ','boq',8],[9,'Attendance','attendance',9],[10,'Tasks','tasks',10],[11,'Admin Panel','admin',11]];
+    for(const[id,nm,pk,ord] of _sm) await c.query('INSERT INTO permission_modules(id,name,pkey,sort_order) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name)',[id,nm,pk,ord]).catch(()=>{});
+    await c.query("INSERT INTO permission_groups(id,name,role_key,color) VALUES(1,'Master Admin','admin','#dc2626'),(2,'Supervisor','supervisor','#7c3aed'),(3,'User','member','#0ea5e9') ON DUPLICATE KEY UPDATE name=VALUES(name)").catch(()=>{});
+    await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1',['admin']).catch(()=>{});
+    await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1',['supervisor']).catch(()=>{});
+    await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1',['member']).catch(()=>{});
+    console.log('[setup] Security OK');
     console.error('setupDatabase error:',err);
     throw err;
   }finally{
@@ -1715,43 +1713,37 @@ app.get('/api/security/debug', auth, adminOnly, wrap(async(req,res)=>{
   try{const[r]=await pool.query('SELECT COUNT(*) as c FROM permission_modules');results.modules_count=r[0].c;}catch(e){results.modules_error=e.message;}
   try{const[r]=await pool.query('SELECT COUNT(*) as c FROM group_permissions');results.perms_count=r[0].c;}catch(e){results.perms_error=e.message;}
   try{const[r]=await pool.query('SELECT id,name,role_key,color FROM permission_groups ORDER BY id');results.groups=r;}catch(e){results.groups_fetch_error=e.message;}
-  try{const[r]=await pool.query('SELECT id,name,`key` FROM permission_modules ORDER BY sort_order');results.modules=r;}catch(e){results.modules_fetch_error=e.message;}
+  try{const[r]=await pool.query('SELECT id,name,pkey as `key` FROM permission_modules ORDER BY sort_order');results.modules=r;}catch(e){results.modules_fetch_error=e.message;}
   res.json(results);
 }));
 
 /* Force re-seed security tables via GET request */
 app.get('/api/security/setup', auth, adminOnly, wrap(async(req,res)=>{
-  const c=await pool.getConnection();
-  const log=[];
+  const c2=await pool.getConnection();
   try{
-    /* Ensure tables exist */
-    await c.query(`CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,\`key\` VARCHAR(50) NOT NULL,sort_order INT DEFAULT 0,UNIQUE KEY uq_key(\`key\`))`).catch(e=>log.push('pm:'+e.message));
-    await c.query(`CREATE TABLE IF NOT EXISTS permission_groups(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,role_key VARCHAR(50) DEFAULT NULL,color VARCHAR(20) DEFAULT '#6b7280')`).catch(e=>log.push('pg:'+e.message));
-    await c.query(`CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0,UNIQUE KEY uq_gm(group_id,module_id))`).catch(e=>log.push('gp:'+e.message));
-    /* Seed modules */
+    await c2.query('CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,pkey VARCHAR(50) NOT NULL,sort_order INT DEFAULT 0)').catch(()=>{});
+    await c2.query('CREATE TABLE IF NOT EXISTS permission_groups(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,role_key VARCHAR(50),color VARCHAR(20) DEFAULT \'#6b7280\')').catch(()=>{});
+    await c2.query('CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0)').catch(()=>{});
     const mods=[[1,'Customers','customers',1],[2,'Contact Persons','contacts',2],[3,'Quotes (CPQ)','quotes',3],[4,'Quote Follow-Up','followup',4],[5,'Products','products',5],[6,'Suppliers','suppliers',6],[7,'Delivery Notes','delivery_notes',7],[8,'BOQ','boq',8],[9,'Attendance','attendance',9],[10,'Tasks','tasks',10],[11,'Admin Panel','admin',11]];
-    for(const[id,name,key,ord] of mods) await c.query('INSERT IGNORE INTO permission_modules(id,name,`key`,sort_order) VALUES(?,?,?,?)',[id,name,key,ord]).catch(()=>{});
-    /* Seed groups */
-    await c.query("INSERT IGNORE INTO permission_groups(id,name,role_key,color) VALUES(1,'Master Admin','admin','#dc2626'),(2,'Supervisor','supervisor','#7c3aed'),(3,'User','member','#0ea5e9')").catch(()=>{});
-    /* Seed permissions */
-    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key='admin'").catch(()=>{});
-    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key='supervisor'").catch(()=>{});
-    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key='member'").catch(()=>{});
-    const[[gc]]=await c.query('SELECT COUNT(*) as n FROM permission_groups');
-    const[[mc]]=await c.query('SELECT COUNT(*) as n FROM permission_modules');
-    const[[pc]]=await c.query('SELECT COUNT(*) as n FROM group_permissions');
-    res.json({success:true,groups:gc.n,modules:mc.n,permissions:pc.n,log});
-  }catch(e){res.json({success:false,error:e.message,log});}
-  finally{c.release();}
+    for(const[id,nm,pk,ord] of mods) await c2.query('INSERT INTO permission_modules(id,name,pkey,sort_order) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name)',[id,nm,pk,ord]).catch(()=>{});
+    await c2.query("INSERT INTO permission_groups(id,name,role_key,color) VALUES(1,'Master Admin','admin','#dc2626'),(2,'Supervisor','supervisor','#7c3aed'),(3,'User','member','#0ea5e9') ON DUPLICATE KEY UPDATE name=VALUES(name)").catch(()=>{});
+    await c2.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1',['admin']).catch(()=>{});
+    await c2.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1',['supervisor']).catch(()=>{});
+    await c2.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1',['member']).catch(()=>{});
+    const[[gc]]=await c2.query('SELECT COUNT(*) as n FROM permission_groups');
+    const[[mc]]=await c2.query('SELECT COUNT(*) as n FROM permission_modules');
+    const[[pc]]=await c2.query('SELECT COUNT(*) as n FROM group_permissions');
+    res.json({success:true,groups:gc.n,modules:mc.n,permissions:pc.n});
+  }catch(e){res.status(500).json({error:e.message});}
+  finally{c2.release();}
 }));
-
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
   let groups=[],perms=[],modules=[];
   try{[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id');}
   catch(e){console.error('[security/groups] groups query failed:',e.message);}
   try{[perms]=await pool.query('SELECT * FROM group_permissions');}
   catch(e){console.error('[security/groups] perms query failed:',e.message);}
-  try{[modules]=await pool.query('SELECT * FROM permission_modules ORDER BY sort_order,name');}
+  try{[modules]=await pool.query('SELECT id, name, pkey as `key`, sort_order FROM permission_modules ORDER BY sort_order,name');}
   catch(e){console.error('[security/groups] modules query failed:',e.message);}
   const seenG=new Set();const uniqGroups=(groups||[]).filter(g=>{if(seenG.has(g.name))return false;seenG.add(g.name);return true;});
   const seenM=new Set();const uniqModules=(modules||[]).filter(m=>{if(seenM.has(m.key))return false;seenM.add(m.key);return true;});
