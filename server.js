@@ -495,6 +495,25 @@ async function setupDatabase(){
 }
 
 /* ══════════════════════════════════════
+   PERMISSION HELPER
+══════════════════════════════════════ */
+async function getUserPerms(userId, role, groupId){
+  let gid=groupId;
+  if(!gid){const[[g]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[role||'member']).catch(()=>[[null]]);if(g)gid=g.id;}
+  if(!gid) return {};
+  const[rows]=await pool.query('SELECT COALESCE(m.pkey,m.key) as mkey,gp.can_view,gp.can_create,gp.can_edit,gp.can_delete FROM group_permissions gp JOIN permission_modules m ON gp.module_id=m.id WHERE gp.group_id=?',[gid]).catch(()=>[[]]);
+  const p={};
+  (rows||[]).forEach(r=>{p[r.mkey]={view:!!r.can_view,create:!!r.can_create,edit:!!r.can_edit,delete:!!r.can_delete};});
+  return p;
+}
+const requirePerm=(module,action)=>async(req,res,next)=>{
+  if(req.user.role==='admin')return next();
+  const p=await getUserPerms(req.user.id,req.user.role,req.user.group_id);
+  if(p[module]&&p[module][action])return next();
+  return res.status(403).json({error:`Permission denied: ${action} on ${module}`});
+};
+
+/* ══════════════════════════════════════
    MIDDLEWARE
 ══════════════════════════════════════ */
 const JWT_SECRET = process.env.JWT_SECRET||'synapse_secret';
@@ -544,7 +563,16 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
   const u=rows[0];
   if(!await bcrypt.compare(password,u.password_hash)) return res.status(401).json({error:'Invalid credentials'});
   const token=jwt.sign({id:u.id,username:u.username,role:u.role},JWT_SECRET,{expiresIn:'8h'});
+  /* Load group permissions */
   let permissions={};
+  const gid=u.group_id;
+  const gRole=u.role||'member';
+  let resolvedGroupId=gid;
+  if(!resolvedGroupId){const[[rg]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[gRole]).catch(()=>[[null]]);if(rg)resolvedGroupId=rg.id;}
+  if(resolvedGroupId){
+    const[gperms]=await pool.query('SELECT COALESCE(m.pkey,m.key) as mkey,gp.can_view,gp.can_create,gp.can_edit,gp.can_delete FROM group_permissions gp JOIN permission_modules m ON gp.module_id=m.id WHERE gp.group_id=?',[resolvedGroupId]).catch(()=>[[]]);
+    (gperms||[]).forEach(p=>{permissions[p.mkey]={view:!!p.can_view,create:!!p.can_create,edit:!!p.can_edit,delete:!!p.can_delete};});
+  }
 
   // Capture real client IP (behind proxies)
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
@@ -1626,7 +1654,7 @@ app.get('/api/clients', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(sql,params);
   res.json(rows);
 }));
-app.post('/api/clients', auth, wrap(async(req,res)=>{
+app.post('/api/clients', auth, requirePerm('customers','create'), wrap(async(req,res)=>{
   const{name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile,address}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
   if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
@@ -1642,7 +1670,7 @@ app.post('/api/clients', auth, wrap(async(req,res)=>{
     ]).catch(()=>{});
   res.json({success:true,id:r.insertId});
 }));
-app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
+app.put('/api/clients/:id', auth, requirePerm('customers','edit'), wrap(async(req,res)=>{
   const{name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
   if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
@@ -1818,12 +1846,12 @@ app.get('/api/security/my-permissions', auth, wrap(async(req,res)=>{
   if(!groupId) return res.json({});
   const group={id:groupId};
   const[perms]=await pool.query(`
-    SELECT m.key,gp.can_view,gp.can_create,gp.can_edit,gp.can_delete
+    SELECT COALESCE(m.pkey,m.key) as mkey,gp.can_view,gp.can_create,gp.can_edit,gp.can_delete
     FROM group_permissions gp
     JOIN permission_modules m ON gp.module_id=m.id
     WHERE gp.group_id=?`,[groupId]);
   const result={};
-  perms.forEach(p=>{result[p.key]={view:!!p.can_view,create:!!p.can_create,edit:!!p.can_edit,delete:!!p.can_delete};});
+  perms.forEach(p=>{result[p.mkey]={view:!!p.can_view,create:!!p.can_create,edit:!!p.can_edit,delete:!!p.can_delete};});
   res.json(result);
 }));
 
@@ -1999,7 +2027,7 @@ app.get('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
   const[items]=await pool.query('SELECT * FROM cpq_quote_items WHERE quote_id=? ORDER BY sort_order,id',[req.params.id]);
   res.json({...q,items});
 }));
-app.post('/api/cpq/quotes', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/quotes', auth, requirePerm('quotes','create'), wrap(async(req,res)=>{
   const{quote_date,valid_till,status,customer_name,customer_email,customer_phone,customer_address,subject,notes,discount_pct,subtotal,discount_amount,total,total_cost,total_profit,currency,version_number,customer_trn,customer_city,customer_country,contact_person,vat_rate,vat_amount,items,quote_number_override,prepared_by_override}=req.body;
   /* Server-side validation */
   if(!customer_name&&!req.body.customer_id) return res.status(400).json({error:'Customer is required'});
@@ -2230,7 +2258,7 @@ app.get('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
   res.json(rows);
 }));
 
-app.post('/api/clients/:id/contacts', auth, wrap(async(req,res)=>{
+app.post('/api/clients/:id/contacts', auth, requirePerm('contacts','create'), wrap(async(req,res)=>{
   const{name,phone,email,whatsapp,designation,is_primary}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Name is required'});
   if(is_primary){
@@ -2283,7 +2311,7 @@ app.get('/api/clients/contacts/:cid/logs', auth, wrap(async(req,res)=>{
   res.json(rows);
 }));
 
-app.delete('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
+app.delete('/api/clients/contacts/:cid', auth, requirePerm('contacts','delete'), adminOnly, wrap(async(req,res)=>{
   await pool.query('DELETE FROM client_contacts WHERE id=?',[req.params.cid]);
   res.json({success:true});
 }));
@@ -2386,7 +2414,7 @@ app.get('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
   res.json(Object.assign(d,{items}));
 }));
 
-app.post('/api/delivery-notes', auth, wrap(async(req,res)=>{
+app.post('/api/delivery-notes', auth, requirePerm('delivery_notes','create'), wrap(async(req,res)=>{
   const{dn_date,status,client_id,client_name,client_address,client_phone,delivery_person_id,delivery_person_name,notes,items,dn_number_custom}=req.body;
   const dnNum=dn_number_custom||await nextDNNumber();
   const[[dp]]=await pool.query('SELECT full_name FROM users WHERE id=?',[delivery_person_id||req.user.id]);
@@ -2425,7 +2453,7 @@ app.put('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
   res.json({success:true,dn_number:newNum});
 }));
 
-app.delete('/api/delivery-notes/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/delivery-notes/:id', auth, requirePerm('delivery_notes','delete'), wrap(async(req,res)=>{
   const[[d]]=await pool.query('SELECT created_by FROM delivery_notes WHERE id=?',[req.params.id]);
   if(!d) return res.status(404).json({error:'Not found'});
   if(req.user.role!=='admin'&&d.created_by!==req.user.id) return res.status(403).json({error:'Forbidden'});
