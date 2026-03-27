@@ -496,6 +496,7 @@ async function setupDatabase(){
     await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1',['supervisor']).catch(()=>{});
     await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key=? ON DUPLICATE KEY UPDATE can_view=1',['member']).catch(()=>{});
     console.log('[setup] Security OK');
+  }catch(err){
     console.error('setupDatabase error:',err);
     throw err;
   }finally{
