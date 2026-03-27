@@ -773,10 +773,13 @@ app.get('/api/users', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(`
     SELECT u.id,u.username,u.email,u.full_name,u.role,u.employee_category,u.department,
       u.avatar_color,u.is_active,u.must_change_password,u.last_login_at,u.last_login_ip,u.created_at,
-      u.schedule_id,u.group_id,pg.name as group_name,pg.color as group_color,pg.role_key,
+      u.schedule_id,
       sp.can_approve_attendance,sp.can_view_all_attendance,sp.can_edit_tasks,
       sp.can_create_tasks,sp.can_view_all_tasks,sp.can_manage_holidays
-    FROM users u LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id ORDER BY u.full_name`);
+    FROM users u
+    LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id
+    ORDER BY u.full_name`).catch(()=>null);
+  if(!rows) return res.status(500).json({error:'Failed to fetch users'});
   res.json(rows);
 }));
 
