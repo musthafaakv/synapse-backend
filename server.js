@@ -1,4 +1,5 @@
 require('dotenv').config();
+console.log('=== CloudCraft Server Starting - Build 2026-03-27 ===');
 // Polyfill fetch for Node < 18
 if(!globalThis.fetch){
   try{ globalThis.fetch = require('node-fetch'); }catch(e){ /* node-fetch not installed, fetch may fail */ }
