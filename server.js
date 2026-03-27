@@ -461,6 +461,10 @@ async function setupDatabase(){
     await c.query('CREATE TABLE IF NOT EXISTS client_contact_logs(id INT AUTO_INCREMENT PRIMARY KEY,contact_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(contact_id),FOREIGN KEY(contact_id) REFERENCES client_contacts(id) ON DELETE CASCADE)').catch(()=>{});
     /* clients audit log */
     await c.query('CREATE TABLE IF NOT EXISTS clients_log(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(client_id))').catch(()=>{});
+    /* Departments table */
+    await c.query('CREATE TABLE IF NOT EXISTS departments(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,is_active TINYINT(1) DEFAULT 1,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
+    /* Seed default departments */
+    await c.query("INSERT IGNORE INTO departments(id,name) VALUES(1,'Management'),(2,'Sales'),(3,'Operations'),(4,'Finance'),(5,'IT')").catch(()=>{});
     /* Security / Permissions tables */
     await c.query('CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,`key` VARCHAR(50) NOT NULL,description VARCHAR(255) DEFAULT NULL,sort_order INT DEFAULT 0)').catch(()=>{});
     await c.query('ALTER TABLE permission_modules ADD UNIQUE KEY IF NOT EXISTS uq_pm_key(`key`)').catch(()=>{});
@@ -1860,6 +1864,24 @@ app.get('/api/clients/:id/logs', auth, wrap(async(req,res)=>{
 /* ══════════════════════════════════════
    SECURITY / PERMISSIONS
 ══════════════════════════════════════ */
+
+/* ══════════════════════════════════════
+   DEPARTMENTS
+══════════════════════════════════════ */
+app.get('/api/departments', auth, wrap(async(req,res)=>{
+  const[rows]=await pool.query('SELECT * FROM departments WHERE is_active=1 ORDER BY name');
+  res.json(rows);
+}));
+app.post('/api/departments', auth, adminOnly, wrap(async(req,res)=>{
+  const{name}=req.body;
+  if(!name||!name.trim()) return res.status(400).json({error:'Name required'});
+  const[r]=await pool.query('INSERT INTO departments(name) VALUES(?)',[name.trim()]);
+  res.json({id:r.insertId,success:true});
+}));
+app.delete('/api/departments/:id', auth, adminOnly, wrap(async(req,res)=>{
+  await pool.query('UPDATE departments SET is_active=0 WHERE id=?',[req.params.id]);
+  res.json({success:true});
+}));
 
 /* GET all groups with their permissions */
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
