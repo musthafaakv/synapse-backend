@@ -483,21 +483,7 @@ async function setupDatabase(){
     for(const[name,role_key,desc,color] of defaultGroups){
       await c.query('INSERT IGNORE INTO permission_groups(name,role_key,description,color) VALUES(?,?,?,?)',[name,role_key,desc,color]).catch(()=>{});
     }
-    /* Deduplicate permission_groups — keep lowest id per name */
-    await c.query(`
-      DELETE pg1 FROM permission_groups pg1
-      INNER JOIN permission_groups pg2
-      WHERE pg1.name=pg2.name AND pg1.id>pg2.id`).catch(()=>{});
-    /* Deduplicate permission_modules — keep lowest id per key */
-    await c.query(`
-      DELETE pm1 FROM permission_modules pm1
-      INNER JOIN permission_modules pm2
-      WHERE pm1.\`key\`=pm2.\`key\` AND pm1.id>pm2.id`).catch(()=>{});
-    /* Deduplicate group_permissions — keep lowest id per group+module combo */
-    await c.query(`
-      DELETE gp1 FROM group_permissions gp1
-      INNER JOIN group_permissions gp2
-      WHERE gp1.group_id=gp2.group_id AND gp1.module_id=gp2.module_id AND gp1.id>gp2.id`).catch(()=>{});
+    /* Deduplication handled at query level in GET /api/security/groups */
     /* Seed default group permissions */
     await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key='admin'").catch(()=>{});
     await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key='supervisor'").catch(()=>{});
@@ -1921,10 +1907,13 @@ app.delete('/api/departments/:id', auth, adminOnly, wrap(async(req,res)=>{
 
 /* GET all groups with their permissions */
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
-  const[groups]=await pool.query('SELECT * FROM permission_groups GROUP BY name ORDER BY id').catch(()=>[[]]);
+  const[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id').catch(()=>[[]]);
   const[perms]=await pool.query('SELECT * FROM group_permissions').catch(()=>[[]]);
-  const[modules]=await pool.query('SELECT * FROM permission_modules GROUP BY `key` ORDER BY sort_order,name').catch(()=>[[]]);
-  res.json({groups:groups||[],perms:perms||[],modules:modules||[]});
+  const[modules]=await pool.query('SELECT * FROM permission_modules ORDER BY sort_order,name').catch(()=>[[]]);
+  /* Deduplicate in JS to avoid MySQL strict mode GROUP BY issues */
+  const seenG=new Set();const uniqGroups=(groups||[]).filter(g=>{if(seenG.has(g.name))return false;seenG.add(g.name);return true;});
+  const seenM=new Set();const uniqModules=(modules||[]).filter(m=>{if(seenM.has(m.key))return false;seenM.add(m.key);return true;});
+  res.json({groups:uniqGroups,perms:perms||[],modules:uniqModules});
 }));
 
 /* POST create group */
