@@ -623,6 +623,18 @@ app.put('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
   res.json({success:true});
 }));
 
+app.get('/api/users/:id', auth, wrap(async(req,res)=>{
+  const[[u]]=await pool.query(`
+    SELECT u.id,u.username,u.email,u.full_name,u.role,u.department,u.avatar_color,
+      u.is_active,u.schedule_id,u.group_id,
+      pg.name as group_name,pg.color as group_color,pg.role_key
+    FROM users u
+    LEFT JOIN permission_groups pg ON u.group_id=pg.id
+    WHERE u.id=?`,[req.params.id]).catch(()=>[[]]);
+  if(!u) return res.status(404).json({error:'User not found'});
+  res.json(u);
+}));
+
 app.delete('/api/users/:id', auth, adminOnly, wrap(async(req,res)=>{
   const uid=parseInt(req.params.id);
   if(uid===req.user.id) return res.status(400).json({error:'Cannot delete your own account'});
@@ -1722,6 +1734,12 @@ app.get('/api/security/setup', auth, adminOnly, wrap(async(req,res)=>{
   }catch(e){res.status(500).json({error:e.message});}
   finally{c2.release();}
 }));
+/* Lightweight groups list for dropdowns - accessible to all auth users */
+app.get('/api/security/groups/list', auth, wrap(async(req,res)=>{
+  const[groups]=await pool.query('SELECT id,name,role_key,color FROM permission_groups ORDER BY id').catch(()=>[[]]);
+  res.json(groups||[]);
+}));
+
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
   let groups=[],perms=[],modules=[];
   try{[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id');}
