@@ -483,6 +483,21 @@ async function setupDatabase(){
     for(const[name,role_key,desc,color] of defaultGroups){
       await c.query('INSERT IGNORE INTO permission_groups(name,role_key,description,color) VALUES(?,?,?,?)',[name,role_key,desc,color]).catch(()=>{});
     }
+    /* Deduplicate permission_groups — keep lowest id per name */
+    await c.query(`
+      DELETE pg1 FROM permission_groups pg1
+      INNER JOIN permission_groups pg2
+      WHERE pg1.name=pg2.name AND pg1.id>pg2.id`).catch(()=>{});
+    /* Deduplicate permission_modules — keep lowest id per key */
+    await c.query(`
+      DELETE pm1 FROM permission_modules pm1
+      INNER JOIN permission_modules pm2
+      WHERE pm1.\`key\`=pm2.\`key\` AND pm1.id>pm2.id`).catch(()=>{});
+    /* Deduplicate group_permissions — keep lowest id per group+module combo */
+    await c.query(`
+      DELETE gp1 FROM group_permissions gp1
+      INNER JOIN group_permissions gp2
+      WHERE gp1.group_id=gp2.group_id AND gp1.module_id=gp2.module_id AND gp1.id>gp2.id`).catch(()=>{});
     /* Seed default group permissions */
     await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key='admin'").catch(()=>{});
     await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key='supervisor'").catch(()=>{});
@@ -1906,18 +1921,28 @@ app.delete('/api/departments/:id', auth, adminOnly, wrap(async(req,res)=>{
 
 /* GET all groups with their permissions */
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
-  const[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id').catch(()=>[[]]);
+  const[groups]=await pool.query('SELECT * FROM permission_groups GROUP BY name ORDER BY id').catch(()=>[[]]);
   const[perms]=await pool.query('SELECT * FROM group_permissions').catch(()=>[[]]);
-  const[modules]=await pool.query('SELECT * FROM permission_modules ORDER BY sort_order,name').catch(()=>[[]]);
+  const[modules]=await pool.query('SELECT * FROM permission_modules GROUP BY `key` ORDER BY sort_order,name').catch(()=>[[]]);
   res.json({groups:groups||[],perms:perms||[],modules:modules||[]});
 }));
 
 /* POST create group */
 app.post('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
-  const{name,description,color}=req.body;
+  const{name,description,color,role_key}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Name required'});
-  const[r]=await pool.query('INSERT INTO permission_groups(name,description,color) VALUES(?,?,?)',[name.trim(),description||null,color||'#6b7280']);
-  res.json({id:r.insertId,success:true});
+  /* Prevent duplicates */
+  const[[existing]]=await pool.query('SELECT id FROM permission_groups WHERE name=?',[name.trim()]).catch(()=>[[null]]);
+  if(existing) return res.status(400).json({error:'A group with this name already exists'});
+  const[r]=await pool.query('INSERT INTO permission_groups(name,description,color,role_key) VALUES(?,?,?,?)',[name.trim(),description||null,color||'#6b7280',role_key||null]);
+  const gid=r.insertId;
+  /* Auto-insert empty permissions rows for all modules so the group shows up in the matrix */
+  const[mods]=await pool.query('SELECT id FROM permission_modules').catch(()=>[[]]);
+  if(mods&&mods.length){
+    const vals=mods.map(m=>[gid,m.id,0,0,0,0]);
+    await pool.query('INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) VALUES ?',[vals]).catch(()=>{});
+  }
+  res.json({id:gid,success:true});
 }));
 
 /* PUT update group */
