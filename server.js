@@ -461,6 +461,8 @@ async function setupDatabase(){
     await c.query('CREATE TABLE IF NOT EXISTS client_contact_logs(id INT AUTO_INCREMENT PRIMARY KEY,contact_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(contact_id),FOREIGN KEY(contact_id) REFERENCES client_contacts(id) ON DELETE CASCADE)').catch(()=>{});
     /* clients audit log */
     await c.query('CREATE TABLE IF NOT EXISTS clients_log(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(client_id))').catch(()=>{});
+    /* Add group_id to users */
+    await c.query('ALTER TABLE users ADD COLUMN group_id INT DEFAULT NULL').catch(()=>{});
     /* Departments table */
     await c.query('CREATE TABLE IF NOT EXISTS departments(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,is_active TINYINT(1) DEFAULT 1,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
     /* Seed default departments */
@@ -713,6 +715,11 @@ const auth = async(req,res,next)=>{
       const[perms]=await pool.query('SELECT * FROM supervisor_permissions WHERE user_id=?',[req.user.id]);
       req.user.permissions = perms[0]||{};
     }
+    /* Attach group_id for permission lookups */
+    if(!req.user.group_id){
+      const[[u]]=await pool.query('SELECT group_id FROM users WHERE id=?',[req.user.id]).catch(()=>[[null]]);
+      if(u)req.user.group_id=u.group_id;
+    }
     next();
   }catch{ res.status(401).json({error:'Invalid token'}); }
 };
@@ -766,7 +773,7 @@ app.get('/api/users', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query(`
     SELECT u.id,u.username,u.email,u.full_name,u.role,u.employee_category,u.department,
       u.avatar_color,u.is_active,u.must_change_password,u.last_login_at,u.last_login_ip,u.created_at,
-      u.schedule_id,
+      u.schedule_id,u.group_id,pg.name as group_name,pg.color as group_color,pg.role_key,
       sp.can_approve_attendance,sp.can_view_all_attendance,sp.can_edit_tasks,
       sp.can_create_tasks,sp.can_view_all_tasks,sp.can_manage_holidays
     FROM users u LEFT JOIN supervisor_permissions sp ON u.id=sp.user_id ORDER BY u.full_name`);
@@ -774,7 +781,10 @@ app.get('/api/users', auth, wrap(async(req,res)=>{
 }));
 
 app.post('/api/users', auth, adminOnly, wrap(async(req,res)=>{
-  const{username,email,password,full_name,role,employee_category,department,schedule_id:newSchedId}=req.body;
+  const{username,email,password,full_name,role,employee_category,department,schedule_id:newSchedId,group_id}=req.body;
+  /* Derive role from group if group_id provided */
+  let effectiveRole=role||'member';
+  if(group_id){const[[grp]]=await pool.query('SELECT role_key FROM permission_groups WHERE id=?',[group_id]).catch(()=>[[null]]);if(grp&&grp.role_key)effectiveRole=grp.role_key;}
   if(!username||!password) return res.status(400).json({error:'Username and password are required'});
   const hash=await bcrypt.hash(password,10);
   const colors=['#3B82F6','#10B981','#F59E0B','#8B5CF6','#EC4899','#06B6D4'];
@@ -1372,6 +1382,7 @@ app.get('/api/admin/attendance/stats', auth, adminOrSupervisor, wrap(async(req,r
     COALESCE(SUM(a.clock_in_flag='late'),0) as late,
     COALESCE(SUM(a.clock_out_flag='early'),0) as early_out
     FROM users u
+    LEFT JOIN permission_groups pg ON u.group_id=pg.id
     LEFT JOIN attendance_categories ac ON u.schedule_id=ac.id
     LEFT JOIN attendance a ON u.id=a.user_id AND a.work_date BETWEEN ? AND ?
     WHERE u.is_active=1 AND u.role IN('member','supervisor')
@@ -1926,14 +1937,16 @@ app.post('/api/security/groups/:id/permissions', auth, adminOnly, wrap(async(req
 
 /* GET my permissions (for current user role) */
 app.get('/api/security/my-permissions', auth, wrap(async(req,res)=>{
-  const role=req.user.role||'member';
-  const[[group]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[role]);
-  if(!group) return res.json({});
+  /* First try user's direct group_id, fall back to role-based group */
+  let groupId=req.user.group_id;
+  if(!groupId){const role=req.user.role||'member';const[[grp]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[role]).catch(()=>[[null]]);groupId=grp?grp.id:null;}
+  if(!groupId) return res.json({});
+  const group={id:groupId};
   const[perms]=await pool.query(`
     SELECT m.key,gp.can_view,gp.can_create,gp.can_edit,gp.can_delete
     FROM group_permissions gp
     JOIN permission_modules m ON gp.module_id=m.id
-    WHERE gp.group_id=?`,[group.id]);
+    WHERE gp.group_id=?`,[groupId]);
   const result={};
   perms.forEach(p=>{result[p.key]={view:!!p.can_view,create:!!p.can_create,edit:!!p.can_edit,delete:!!p.can_delete};});
   res.json(result);
