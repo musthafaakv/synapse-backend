@@ -462,28 +462,25 @@ async function setupDatabase(){
     /* clients audit log */
     await c.query('CREATE TABLE IF NOT EXISTS clients_log(id INT AUTO_INCREMENT PRIMARY KEY,client_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(client_id))').catch(()=>{});
     /* Security / Permissions tables */
-    await c.query('CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,key VARCHAR(50) NOT NULL UNIQUE,description VARCHAR(255) DEFAULT NULL,sort_order INT DEFAULT 0)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,`key` VARCHAR(50) NOT NULL,description VARCHAR(255) DEFAULT NULL,sort_order INT DEFAULT 0)').catch(()=>{});
+    await c.query('ALTER TABLE permission_modules ADD UNIQUE KEY IF NOT EXISTS uq_pm_key(`key`)').catch(()=>{});
     await c.query('CREATE TABLE IF NOT EXISTS permission_groups(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,role_key VARCHAR(50) DEFAULT NULL,description VARCHAR(255) DEFAULT NULL,color VARCHAR(20) DEFAULT \'#6b7280\',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
-    await c.query('CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0,UNIQUE KEY uq_gm(group_id,module_id),FOREIGN KEY(group_id) REFERENCES permission_groups(id) ON DELETE CASCADE,FOREIGN KEY(module_id) REFERENCES permission_modules(id) ON DELETE CASCADE)').catch(()=>{});
+    await c.query('CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0)').catch(()=>{});
+    await c.query('ALTER TABLE group_permissions ADD UNIQUE KEY IF NOT EXISTS uq_gp(group_id,module_id)').catch(()=>{});
     /* Seed modules */
     const mods=[['Customers','customers','Customer records management',1],['Contact Persons','contacts','Customer contact persons',2],['Quotes (CPQ)','quotes','Quotations and pricing',3],['Quote Follow-Up','followup','Follow-up tracking',4],['Products','products','Product catalog',5],['Suppliers','suppliers','Supplier management',6],['Delivery Notes','delivery_notes','Delivery note management',7],['BOQ','boq','Bill of Quantities',8],['Attendance','attendance','Attendance tracking',9],['Tasks','tasks','Task management',10],['Admin Panel','admin','Admin settings',11]];
     for(const[name,key,desc,ord] of mods){
-      await c.query('INSERT IGNORE INTO permission_modules(name,key,description,sort_order) VALUES(?,?,?,?)',[name,key,desc,ord]).catch(()=>{});
+      await c.query('INSERT IGNORE INTO permission_modules(name,`key`,description,sort_order) VALUES(?,?,?,?)',[name,key,desc,ord]).catch(()=>{});
     }
     /* Seed default groups */
     const defaultGroups=[['Master Admin','admin','Full access to all modules','#dc2626'],['Supervisor','supervisor','View, create and edit access','#7c3aed'],['User','member','View and create access','#0ea5e9']];
     for(const[name,role_key,desc,color] of defaultGroups){
       await c.query('INSERT IGNORE INTO permission_groups(name,role_key,description,color) VALUES(?,?,?,?)',[name,role_key,desc,color]).catch(()=>{});
     }
-    /* Seed admin full permissions */
-    await c.query(`INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete)
-      SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key='admin'`).catch(()=>{});
-    /* Seed supervisor permissions (view+create+edit) */
-    await c.query(`INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete)
-      SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key='supervisor'`).catch(()=>{});
-    /* Seed user permissions (view+create) */
-    await c.query(`INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete)
-      SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key='member'`).catch(()=>{});
+    /* Seed default group permissions */
+    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key='admin'").catch(()=>{});
+    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key='supervisor'").catch(()=>{});
+    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key='member'").catch(()=>{});
     /* client_contacts log field migrations */
     await c.query('ALTER TABLE client_contacts ADD COLUMN added_by INT DEFAULT NULL').catch(()=>{});
     await c.query('ALTER TABLE client_contacts ADD COLUMN added_by_name VARCHAR(255) DEFAULT NULL').catch(()=>{});
@@ -1866,10 +1863,10 @@ app.get('/api/clients/:id/logs', auth, wrap(async(req,res)=>{
 
 /* GET all groups with their permissions */
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
-  const[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id');
-  const[perms]=await pool.query('SELECT * FROM group_permissions');
-  const[modules]=await pool.query('SELECT * FROM permission_modules ORDER BY sort_order,name');
-  res.json({groups,perms,modules});
+  const[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id').catch(()=>[[]]);
+  const[perms]=await pool.query('SELECT * FROM group_permissions').catch(()=>[[]]);
+  const[modules]=await pool.query('SELECT * FROM permission_modules ORDER BY sort_order,name').catch(()=>[[]]);
+  res.json({groups:groups||[],perms:perms||[],modules:modules||[]});
 }));
 
 /* POST create group */
