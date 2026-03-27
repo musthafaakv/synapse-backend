@@ -1714,8 +1714,35 @@ app.get('/api/security/debug', auth, adminOnly, wrap(async(req,res)=>{
   try{const[r]=await pool.query('SELECT COUNT(*) as c FROM permission_groups');results.groups_count=r[0].c;}catch(e){results.groups_error=e.message;}
   try{const[r]=await pool.query('SELECT COUNT(*) as c FROM permission_modules');results.modules_count=r[0].c;}catch(e){results.modules_error=e.message;}
   try{const[r]=await pool.query('SELECT COUNT(*) as c FROM group_permissions');results.perms_count=r[0].c;}catch(e){results.perms_error=e.message;}
-  try{const[r]=await pool.query('SELECT id,name,role_key FROM permission_groups');results.groups=r;}catch(e){results.groups_fetch_error=e.message;}
+  try{const[r]=await pool.query('SELECT id,name,role_key,color FROM permission_groups ORDER BY id');results.groups=r;}catch(e){results.groups_fetch_error=e.message;}
+  try{const[r]=await pool.query('SELECT id,name,`key` FROM permission_modules ORDER BY sort_order');results.modules=r;}catch(e){results.modules_fetch_error=e.message;}
   res.json(results);
+}));
+
+/* Force re-seed security tables via GET request */
+app.get('/api/security/setup', auth, adminOnly, wrap(async(req,res)=>{
+  const c=await pool.getConnection();
+  const log=[];
+  try{
+    /* Ensure tables exist */
+    await c.query(`CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,\`key\` VARCHAR(50) NOT NULL,sort_order INT DEFAULT 0,UNIQUE KEY uq_key(\`key\`))`).catch(e=>log.push('pm:'+e.message));
+    await c.query(`CREATE TABLE IF NOT EXISTS permission_groups(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,role_key VARCHAR(50) DEFAULT NULL,color VARCHAR(20) DEFAULT '#6b7280')`).catch(e=>log.push('pg:'+e.message));
+    await c.query(`CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0,UNIQUE KEY uq_gm(group_id,module_id))`).catch(e=>log.push('gp:'+e.message));
+    /* Seed modules */
+    const mods=[[1,'Customers','customers',1],[2,'Contact Persons','contacts',2],[3,'Quotes (CPQ)','quotes',3],[4,'Quote Follow-Up','followup',4],[5,'Products','products',5],[6,'Suppliers','suppliers',6],[7,'Delivery Notes','delivery_notes',7],[8,'BOQ','boq',8],[9,'Attendance','attendance',9],[10,'Tasks','tasks',10],[11,'Admin Panel','admin',11]];
+    for(const[id,name,key,ord] of mods) await c.query('INSERT IGNORE INTO permission_modules(id,name,`key`,sort_order) VALUES(?,?,?,?)',[id,name,key,ord]).catch(()=>{});
+    /* Seed groups */
+    await c.query("INSERT IGNORE INTO permission_groups(id,name,role_key,color) VALUES(1,'Master Admin','admin','#dc2626'),(2,'Supervisor','supervisor','#7c3aed'),(3,'User','member','#0ea5e9')").catch(()=>{});
+    /* Seed permissions */
+    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key='admin'").catch(()=>{});
+    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key='supervisor'").catch(()=>{});
+    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key='member'").catch(()=>{});
+    const[[gc]]=await c.query('SELECT COUNT(*) as n FROM permission_groups');
+    const[[mc]]=await c.query('SELECT COUNT(*) as n FROM permission_modules');
+    const[[pc]]=await c.query('SELECT COUNT(*) as n FROM group_permissions');
+    res.json({success:true,groups:gc.n,modules:mc.n,permissions:pc.n,log});
+  }catch(e){res.json({success:false,error:e.message,log});}
+  finally{c.release();}
 }));
 
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
