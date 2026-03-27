@@ -767,21 +767,22 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
    USERS
 ══════════════════════════════════════ */
 app.get('/api/users', auth, wrap(async(req,res)=>{
-  const[rows]=await pool.query(`
-    SELECT u.id,u.username,u.email,u.full_name,u.role,u.employee_category,u.department,
-      u.avatar_color,u.is_active,u.must_change_password,u.last_login_at,u.last_login_ip,u.created_at,
-      u.schedule_id,u.group_id,
-      pg.name as group_name,pg.color as group_color,
-    FROM users u
-    LEFT JOIN permission_groups pg ON u.group_id=pg.id
-    ORDER BY u.full_name`).catch(()=>{
-      /* Fallback without group join if table doesn't exist yet */
-      return pool.query(`SELECT u.*,
-        FROM users u
-        ORDER BY u.full_name`).then(r=>r[0]);
-    });
-  if(!rows) return res.status(500).json({error:'Failed to fetch users'});
-  res.json(rows);
+  let rows;
+  try{
+    [rows]=await pool.query(`
+      SELECT u.id,u.username,u.email,u.full_name,u.role,u.employee_category,u.department,
+        u.avatar_color,u.is_active,u.must_change_password,u.last_login_at,u.last_login_ip,u.created_at,
+        u.schedule_id,u.group_id,
+        pg.name as group_name,pg.color as group_color
+      FROM users u
+      LEFT JOIN permission_groups pg ON u.group_id=pg.id
+      ORDER BY u.full_name`);
+  }catch(e){
+    /* Fallback: no group join */
+    try{[rows]=await pool.query('SELECT * FROM users ORDER BY full_name');}
+    catch(e2){return res.status(500).json({error:'Failed to fetch users'});}
+  }
+  res.json(rows||[]);
 }));
 
 app.post('/api/users', auth, adminOnly, wrap(async(req,res)=>{
