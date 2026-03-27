@@ -495,22 +495,27 @@ async function setupDatabase(){
 }
 
 /* ══════════════════════════════════════
-   PERMISSION HELPER
+   PERMISSION MIDDLEWARE
 ══════════════════════════════════════ */
-async function getUserPerms(userId, role, groupId){
-  let gid=groupId;
-  if(!gid){const[[g]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[role||'member']).catch(()=>[[null]]);if(g)gid=g.id;}
-  if(!gid) return {};
-  const[rows]=await pool.query('SELECT COALESCE(m.pkey,m.key) as mkey,gp.can_view,gp.can_create,gp.can_edit,gp.can_delete FROM group_permissions gp JOIN permission_modules m ON gp.module_id=m.id WHERE gp.group_id=?',[gid]).catch(()=>[[]]);
-  const p={};
-  (rows||[]).forEach(r=>{p[r.mkey]={view:!!r.can_view,create:!!r.can_create,edit:!!r.can_edit,delete:!!r.can_delete};});
-  return p;
-}
-const requirePerm=(module,action)=>async(req,res,next)=>{
+const requirePerm=(modKey,action)=>async(req,res,next)=>{
   if(req.user.role==='admin')return next();
-  const p=await getUserPerms(req.user.id,req.user.role,req.user.group_id);
-  if(p[module]&&p[module][action])return next();
-  return res.status(403).json({error:`Permission denied: ${action} on ${module}`});
+  let gid=req.user.group_id;
+  if(!gid){
+    const[[u]]=await pool.query('SELECT group_id FROM users WHERE id=?',[req.user.id]).catch(()=>[[null]]);
+    if(u)gid=u.group_id;
+  }
+  if(!gid){
+    const[[g]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[req.user.role||'member']).catch(()=>[[null]]);
+    if(g)gid=g.id;
+  }
+  if(!gid)return res.status(403).json({error:'No security group assigned. Contact administrator.'});
+  const[[perm]]=await pool.query(`
+    SELECT gp.${action==='view'?'can_view':action==='create'?'can_create':action==='edit'?'can_edit':'can_delete'} as allowed
+    FROM group_permissions gp
+    INNER JOIN permission_modules m ON m.id=gp.module_id
+    WHERE gp.group_id=? AND COALESCE(m.pkey,m.key,'')=?`,[gid,modKey]).catch(()=>[[null]]);
+  if(perm&&perm.allowed)return next();
+  return res.status(403).json({error:`Access denied: You don't have ${action} permission for ${modKey}`});
 };
 
 /* ══════════════════════════════════════
@@ -1670,7 +1675,7 @@ app.post('/api/clients', auth, requirePerm('customers','create'), wrap(async(req
     ]).catch(()=>{});
   res.json({success:true,id:r.insertId});
 }));
-app.put('/api/clients/:id', auth, requirePerm('customers','edit'), wrap(async(req,res)=>{
+app.put('/api/clients/:id', auth, wrap(async(req,res)=>{
   const{name,country,city,client_type,trn,trn_not_registered,additional_details,building_number,street_address,postal_code,email,phone,contact_person,contact_mobile}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Business name is required'});
   if(client_type==='company'&&!trn_not_registered&&trn&&trn.replace(/\s/g,'').length!==15&&trn.replace(/\s/g,'').length>0){
@@ -1696,7 +1701,7 @@ app.put('/api/clients/:id', auth, requirePerm('customers','edit'), wrap(async(re
   res.json({success:true});
 }));
 
-app.delete('/api/clients/:id', auth, adminOnly, wrap(async(req,res)=>{
+app.delete('/api/clients/:id', auth, adminOnly, requirePerm('customers','delete'), wrap(async(req,res)=>{
   await pool.query('UPDATE clients SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -1828,31 +1833,50 @@ app.delete('/api/security/groups/:id', auth, adminOnly, wrap(async(req,res)=>{
 
 /* POST save permissions for a group (bulk upsert) */
 app.post('/api/security/groups/:id/permissions', auth, adminOnly, wrap(async(req,res)=>{
-  const{permissions}=req.body; /* [{module_id, can_view, can_create, can_edit, can_delete}] */
+  const{permissions}=req.body;
   if(!Array.isArray(permissions)) return res.status(400).json({error:'permissions array required'});
-  await pool.query('DELETE FROM group_permissions WHERE group_id=?',[req.params.id]);
+  const gid=req.params.id;
+  await pool.query('DELETE FROM group_permissions WHERE group_id=?',[gid]);
   if(permissions.length){
-    const vals=permissions.map(p=>[req.params.id,p.module_id,p.can_view?1:0,p.can_create?1:0,p.can_edit?1:0,p.can_delete?1:0]);
-    await pool.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) VALUES ?',[vals]);
+    const[modules]=await pool.query('SELECT id,COALESCE(pkey,`key`) as mkey FROM permission_modules').catch(()=>[[]]);
+    const modMap={};(modules||[]).forEach(m=>{if(m.mkey)modMap[m.mkey]=m.id;});
+    const vals=[];
+    permissions.forEach(p=>{
+      const mid=p.module_id||modMap[p.module_key];
+      if(mid) vals.push([gid,mid,p.view?1:0,p.create?1:0,p.edit?1:0,p.delete?1:0]);
+    });
+    if(vals.length) await pool.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) VALUES ?',[vals]);
   }
   res.json({success:true});
 }));
 
 /* GET my permissions (for current user role) */
 app.get('/api/security/my-permissions', auth, wrap(async(req,res)=>{
-  /* First try user's direct group_id, fall back to role-based group */
-  let groupId=req.user.group_id;
-  if(!groupId){const role=req.user.role||'member';const[[grp]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[role]).catch(()=>[[null]]);groupId=grp?grp.id:null;}
-  if(!groupId) return res.json({});
-  const group={id:groupId};
-  const[perms]=await pool.query(`
-    SELECT COALESCE(m.pkey,m.key) as mkey,gp.can_view,gp.can_create,gp.can_edit,gp.can_delete
+  const uid=req.user.id;
+  const role=req.user.role||'member';
+  /* Get user's group_id - from token or fresh from DB */
+  let gid=req.user.group_id;
+  if(!gid){
+    const[[u]]=await pool.query('SELECT group_id FROM users WHERE id=?',[uid]).catch(()=>[[null]]);
+    if(u) gid=u.group_id;
+  }
+  /* Fall back to role-based group */
+  if(!gid){
+    const[[g]]=await pool.query('SELECT id FROM permission_groups WHERE role_key=?',[role]).catch(()=>[[null]]);
+    if(g) gid=g.id;
+  }
+  if(!gid) return res.json({});
+  const[rows]=await pool.query(`
+    SELECT COALESCE(m.pkey,m.key,'') as mod_key,
+           gp.can_view,gp.can_create,gp.can_edit,gp.can_delete
     FROM group_permissions gp
-    JOIN permission_modules m ON gp.module_id=m.id
-    WHERE gp.group_id=?`,[groupId]);
-  const result={};
-  perms.forEach(p=>{result[p.mkey]={view:!!p.can_view,create:!!p.can_create,edit:!!p.can_edit,delete:!!p.can_delete};});
-  res.json(result);
+    INNER JOIN permission_modules m ON m.id=gp.module_id
+    WHERE gp.group_id=?`,[gid]).catch(()=>[[]]);
+  const out={};
+  (rows||[]).forEach(r=>{
+    if(r.mod_key) out[r.mod_key]={view:!!r.can_view,create:!!r.can_create,edit:!!r.can_edit,delete:!!r.can_delete};
+  });
+  res.json(out);
 }));
 
 /* ══════════════════════════════════════
@@ -1954,7 +1978,7 @@ app.get('/api/cpq/products', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query('SELECT p.*,COUNT(pr.id) as price_count FROM cpq_products p LEFT JOIN cpq_prices pr ON p.id=pr.product_id WHERE p.is_active=1 GROUP BY p.id ORDER BY p.category,p.name');
   res.json(rows);
 }));
-app.post('/api/cpq/products', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/products', auth, requirePerm('products','create'), wrap(async(req,res)=>{
   const{name,description,category,sku,unit}=req.body;
   if(!name) return res.status(400).json({error:'Name required'});
   const[r]=await pool.query('INSERT INTO cpq_products(name,description,category,sku,unit,created_by) VALUES(?,?,?,?,?,?)',
@@ -1967,7 +1991,7 @@ app.put('/api/cpq/products/:id', auth, wrap(async(req,res)=>{
     [name,description||null,category||null,sku||null,unit||'pcs',req.params.id]);
   res.json({success:true});
 }));
-app.delete('/api/cpq/products/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/cpq/products/:id', auth, requirePerm('products','delete'), wrap(async(req,res)=>{
   await pool.query('UPDATE cpq_products SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -1983,7 +2007,7 @@ app.get('/api/cpq/suppliers', auth, wrap(async(req,res)=>{
   const[rows]=await pool.query('SELECT s.*,COUNT(pr.id) as product_count FROM cpq_suppliers s LEFT JOIN cpq_prices pr ON s.id=pr.supplier_id WHERE s.is_active=1 GROUP BY s.id ORDER BY s.name');
   res.json(rows);
 }));
-app.post('/api/cpq/suppliers', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/suppliers', auth, requirePerm('suppliers','create'), wrap(async(req,res)=>{
   const{name,contact_name,email,phone,notes}=req.body;
   if(!name) return res.status(400).json({error:'Supplier name required'});
   const[r]=await pool.query('INSERT INTO cpq_suppliers(name,contact_name,email,phone,notes) VALUES(?,?,?,?,?)',
@@ -1996,7 +2020,7 @@ app.put('/api/cpq/suppliers/:id', auth, wrap(async(req,res)=>{
     [name,contact_name||null,email||null,phone||null,notes||null,req.params.id]);
   res.json({success:true});
 }));
-app.delete('/api/cpq/suppliers/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/cpq/suppliers/:id', auth, requirePerm('suppliers','delete'), wrap(async(req,res)=>{
   await pool.query('UPDATE cpq_suppliers SET is_active=0 WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -2130,7 +2154,7 @@ app.put('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
   }
   res.json({success:true});
 }));
-app.delete('/api/cpq/quotes/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/cpq/quotes/:id', auth, requirePerm('quotes','delete'), wrap(async(req,res)=>{
   await pool.query('DELETE FROM cpq_quotes WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -2175,7 +2199,7 @@ app.get('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
   }
   res.json({...b,items});
 }));
-app.post('/api/cpq/boq', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/boq', auth, requirePerm('boq','create'), wrap(async(req,res)=>{
   const{title,boq_date,status,customer_id,customer_name,customer_address,notes,currency,total_supplier_cost,total_selling,total_profit,items}=req.body;
   if(!title) return res.status(400).json({error:'Title required'});
   const bnum=await nextBOQNumber();
@@ -2219,7 +2243,7 @@ app.put('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
   }
   res.json({success:true});
 }));
-app.delete('/api/cpq/boq/:id', auth, wrap(async(req,res)=>{
+app.delete('/api/cpq/boq/:id', auth, requirePerm('boq','delete'), wrap(async(req,res)=>{
   await pool.query('DELETE FROM cpq_boq WHERE id=?',[req.params.id]);
   res.json({success:true});
 }));
@@ -2276,7 +2300,7 @@ app.post('/api/clients/:id/contacts', auth, requirePerm('contacts','create'), wr
   res.json({id:cid,success:true});
 }));
 
-app.put('/api/clients/contacts/:cid', auth, adminOnly, wrap(async(req,res)=>{
+app.put('/api/clients/contacts/:cid', auth, requirePerm('contacts','edit'), adminOnly, wrap(async(req,res)=>{
   const{name,phone,email,whatsapp,designation,is_primary}=req.body;
   if(!name||!name.trim()) return res.status(400).json({error:'Name is required'});
   const[[cc]]=await pool.query('SELECT client_id FROM client_contacts WHERE id=?',[req.params.cid]);
@@ -2345,7 +2369,7 @@ app.get('/api/cpq/followups/quote/:qid', auth, wrap(async(req,res)=>{
 }));
 
 /* POST create follow-up */
-app.post('/api/cpq/followups', auth, wrap(async(req,res)=>{
+app.post('/api/cpq/followups', auth, requirePerm('followup','create'), wrap(async(req,res)=>{
   const{quote_id,status,next_followup_date,comment}=req.body;
   if(!quote_id) return res.status(400).json({error:'quote_id required'});
   const[[q]]=await pool.query('SELECT quote_number,customer_name,total,currency FROM cpq_quotes WHERE id=?',[quote_id]);
