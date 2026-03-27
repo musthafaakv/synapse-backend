@@ -467,239 +467,42 @@ async function setupDatabase(){
     await c.query('CREATE TABLE IF NOT EXISTS departments(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,is_active TINYINT(1) DEFAULT 1,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
     /* Seed default departments */
     await c.query("INSERT IGNORE INTO departments(id,name) VALUES(1,'Management'),(2,'Sales'),(3,'Operations'),(4,'Finance'),(5,'IT')").catch(()=>{});
-    /* Security / Permissions tables */
-    await c.query('CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,`key` VARCHAR(50) NOT NULL,description VARCHAR(255) DEFAULT NULL,sort_order INT DEFAULT 0)').catch(()=>{});
-    await c.query('ALTER TABLE permission_modules ADD UNIQUE KEY IF NOT EXISTS uq_pm_key(`key`)').catch(()=>{});
-    await c.query('CREATE TABLE IF NOT EXISTS permission_groups(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,role_key VARCHAR(50) DEFAULT NULL,description VARCHAR(255) DEFAULT NULL,color VARCHAR(20) DEFAULT \'#6b7280\',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(()=>{});
-    await c.query('CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0)').catch(()=>{});
-    await c.query('ALTER TABLE group_permissions ADD UNIQUE KEY IF NOT EXISTS uq_gp(group_id,module_id)').catch(()=>{});
-    /* Seed modules */
-    const mods=[['Customers','customers','Customer records management',1],['Contact Persons','contacts','Customer contact persons',2],['Quotes (CPQ)','quotes','Quotations and pricing',3],['Quote Follow-Up','followup','Follow-up tracking',4],['Products','products','Product catalog',5],['Suppliers','suppliers','Supplier management',6],['Delivery Notes','delivery_notes','Delivery note management',7],['BOQ','boq','Bill of Quantities',8],['Attendance','attendance','Attendance tracking',9],['Tasks','tasks','Task management',10],['Admin Panel','admin','Admin settings',11]];
-    for(const[name,key,desc,ord] of mods){
-      await c.query('INSERT IGNORE INTO permission_modules(name,`key`,description,sort_order) VALUES(?,?,?,?)',[name,key,desc,ord]).catch(()=>{});
-    }
-    /* Seed default groups */
-    const defaultGroups=[['Master Admin','admin','Full access to all modules','#dc2626'],['Supervisor','supervisor','View, create and edit access','#7c3aed'],['User','member','View and create access','#0ea5e9']];
-    for(const[name,role_key,desc,color] of defaultGroups){
-      await c.query('INSERT IGNORE INTO permission_groups(name,role_key,description,color) VALUES(?,?,?,?)',[name,role_key,desc,color]).catch(()=>{});
-    }
-    /* Deduplication handled at query level in GET /api/security/groups */
-    /* Seed default group permissions */
-    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,1 FROM permission_groups g,permission_modules m WHERE g.role_key='admin'").catch(()=>{});
-    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,1,0 FROM permission_groups g,permission_modules m WHERE g.role_key='supervisor'").catch(()=>{});
-    await c.query("INSERT IGNORE INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT g.id,m.id,1,1,0,0 FROM permission_groups g,permission_modules m WHERE g.role_key='member'").catch(()=>{});
-    /* client_contacts log field migrations */
-    await c.query('ALTER TABLE client_contacts ADD COLUMN added_by INT DEFAULT NULL').catch(()=>{});
-    await c.query('ALTER TABLE client_contacts ADD COLUMN added_by_name VARCHAR(255) DEFAULT NULL').catch(()=>{});
-    await c.query('ALTER TABLE client_contacts ADD COLUMN updated_by INT DEFAULT NULL').catch(()=>{});
-    await c.query('ALTER TABLE client_contacts ADD COLUMN updated_by_name VARCHAR(255) DEFAULT NULL').catch(()=>{});
-    await c.query('CREATE TABLE IF NOT EXISTS cpq_followups(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,quote_number VARCHAR(50),customer_name VARCHAR(255),amount DECIMAL(14,2) DEFAULT 0,currency VARCHAR(10) DEFAULT \'AED\',status VARCHAR(50) DEFAULT \'draft\',next_followup_date DATE DEFAULT NULL,comment TEXT DEFAULT NULL,followed_by INT DEFAULT NULL,followed_by_name VARCHAR(255) DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX(quote_id),INDEX(next_followup_date),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(followed_by) REFERENCES users(id) ON DELETE SET NULL)').catch(()=>{});
-        /* cpq_followups column migrations */
-        /* Safe migration: try adding column, ignore error if exists */
-        await c.query('ALTER TABLE cpq_followups ADD COLUMN next_followup_date DATE DEFAULT NULL').catch(()=>{});
-        await c.query("ALTER TABLE cpq_followups MODIFY COLUMN status VARCHAR(50) DEFAULT 'draft'").catch(()=>{});
-        await c.query('CREATE TABLE IF NOT EXISTS cpq_quote_logs(id INT AUTO_INCREMENT PRIMARY KEY,quote_id INT NOT NULL,action ENUM(\'created\',\'updated\') NOT NULL,changed_by INT DEFAULT NULL,changed_by_name VARCHAR(255) DEFAULT NULL,changes TEXT DEFAULT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX(quote_id),FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,FOREIGN KEY(changed_by) REFERENCES users(id) ON DELETE SET NULL)').catch(()=>{});
-    await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq(
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      boq_number VARCHAR(50) NOT NULL UNIQUE,
-      title VARCHAR(500) NOT NULL,
-      boq_date DATE NOT NULL,
-      status ENUM('draft','submitted','approved','rejected','converted') DEFAULT 'draft',
-      customer_id INT DEFAULT NULL,
-      customer_name VARCHAR(255) DEFAULT NULL,
-      customer_address TEXT DEFAULT NULL,
-      notes TEXT DEFAULT NULL,
-      currency VARCHAR(10) DEFAULT 'AED',
-      total_supplier_cost DECIMAL(14,2) DEFAULT 0,
-      total_selling DECIMAL(14,2) DEFAULT 0,
-      total_profit DECIMAL(14,2) DEFAULT 0,
-      converted_quote_id INT DEFAULT NULL,
-      created_by INT DEFAULT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
-
-    await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq_items(
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      boq_id INT NOT NULL,
-      sort_order INT DEFAULT 0,
-      description TEXT NOT NULL,
-      qty DECIMAL(10,3) DEFAULT 1,
-      unit VARCHAR(50) DEFAULT 'pcs',
-      supplier_cost DECIMAL(12,4) DEFAULT 0,
-      unit_price DECIMAL(12,4) DEFAULT 0,
-      total_price DECIMAL(14,2) DEFAULT 0,
-      notes VARCHAR(500) DEFAULT NULL,
-      product_id INT DEFAULT NULL,
-      FOREIGN KEY(boq_id) REFERENCES cpq_boq(id) ON DELETE CASCADE,
-      FOREIGN KEY(product_id) REFERENCES cpq_products(id) ON DELETE SET NULL)`);
-
-    await c.query(`CREATE TABLE IF NOT EXISTS cpq_boq_supplier_prices(
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      boq_item_id INT NOT NULL,
-      supplier_id INT DEFAULT NULL,
-      supplier_name VARCHAR(255) NOT NULL,
-      cost DECIMAL(12,4) NOT NULL DEFAULT 0,
-      currency VARCHAR(10) DEFAULT 'AED',
-      notes VARCHAR(500) DEFAULT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(boq_item_id) REFERENCES cpq_boq_items(id) ON DELETE CASCADE)`);
-    await c.query(`CREATE TABLE IF NOT EXISTS cpq_products(
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      name VARCHAR(255) NOT NULL,
-      description TEXT DEFAULT NULL,
-      category VARCHAR(100) DEFAULT NULL,
-      sku VARCHAR(100) DEFAULT NULL,
-      unit VARCHAR(50) DEFAULT 'pcs',
-      is_active TINYINT(1) DEFAULT 1,
-      created_by INT DEFAULT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
-
-    await c.query(`CREATE TABLE IF NOT EXISTS cpq_suppliers(
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      name VARCHAR(255) NOT NULL,
-      contact_name VARCHAR(255) DEFAULT NULL,
-      email VARCHAR(255) DEFAULT NULL,
-      phone VARCHAR(50) DEFAULT NULL,
-      notes TEXT DEFAULT NULL,
-      is_active TINYINT(1) DEFAULT 1,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-
-    await c.query(`CREATE TABLE IF NOT EXISTS cpq_prices(
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      product_id INT NOT NULL,
-      supplier_id INT NOT NULL,
-      cost DECIMAL(12,4) NOT NULL DEFAULT 0,
-      currency VARCHAR(10) DEFAULT 'AED',
-      last_updated DATE DEFAULT NULL,
-      notes VARCHAR(500) DEFAULT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_prod_sup(product_id,supplier_id),
-      FOREIGN KEY(product_id) REFERENCES cpq_products(id) ON DELETE CASCADE,
-      FOREIGN KEY(supplier_id) REFERENCES cpq_suppliers(id) ON DELETE CASCADE)`);
-
-    await c.query(`CREATE TABLE IF NOT EXISTS cpq_quotes(
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      quote_number VARCHAR(50) NOT NULL UNIQUE,
-      quote_date DATE NOT NULL,
-      valid_till DATE DEFAULT NULL,
-      status ENUM('draft','sent','accepted','rejected','cancelled') DEFAULT 'draft',
-      customer_name VARCHAR(255) DEFAULT NULL,
-      customer_email VARCHAR(255) DEFAULT NULL,
-      customer_phone VARCHAR(50) DEFAULT NULL,
-      customer_address TEXT DEFAULT NULL,
-      subject VARCHAR(500) DEFAULT NULL,
-      notes TEXT DEFAULT NULL,
-      discount_pct DECIMAL(5,2) DEFAULT 0,
-      subtotal DECIMAL(14,2) DEFAULT 0,
-      discount_amount DECIMAL(14,2) DEFAULT 0,
-      total DECIMAL(14,2) DEFAULT 0,
-      total_cost DECIMAL(14,2) DEFAULT 0,
-      total_profit DECIMAL(14,2) DEFAULT 0,
-      currency VARCHAR(10) DEFAULT 'AED',
-      version_number VARCHAR(50) DEFAULT NULL,
-      customer_trn VARCHAR(50) DEFAULT NULL,
-      customer_city VARCHAR(100) DEFAULT NULL,
-      customer_country VARCHAR(100) DEFAULT NULL,
-      contact_person VARCHAR(255) DEFAULT NULL,
-      vat_rate DECIMAL(5,2) DEFAULT 0,
-      vat_amount DECIMAL(12,2) DEFAULT 0,
-      created_by INT DEFAULT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL)`);
-
-    /* Migrate cpq_quotes table */
-    const cpqQCols=await c.query("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='cpq_quotes'");
-    const existCPQQ=new Set((cpqQCols[0]||[]).map(r=>r.COLUMN_NAME));
-    const cpqQAlters=[
-      ['version_number','VARCHAR(50) DEFAULT NULL'],
-      ['customer_trn','VARCHAR(50) DEFAULT NULL'],
-      ['customer_city','VARCHAR(100) DEFAULT NULL'],
-      ['customer_country','VARCHAR(100) DEFAULT NULL'],
-      ['contact_person','VARCHAR(255) DEFAULT NULL'],
-      ['vat_rate','DECIMAL(5,2) DEFAULT 0'],
-      ['vat_amount','DECIMAL(12,2) DEFAULT 0'],
-      ['discount_amount','DECIMAL(12,2) DEFAULT 0'],
-      ['created_by_name','VARCHAR(255) DEFAULT NULL'],
-      ['last_modified_by','INT DEFAULT NULL'],
-      ['last_modified_by_name','VARCHAR(255) DEFAULT NULL'],
-      ['prepared_by_override','VARCHAR(255) DEFAULT NULL'],
-    ];
-    for(const[col,def] of cpqQAlters){
-      if(!existCPQQ.has(col)){
-        await c.query('ALTER TABLE cpq_quotes ADD COLUMN '+col+' '+def).catch(e=>console.log('migrate cpq_quotes '+col+':',e.message));
+    /* Security / Permissions tables - MySQL 5.7 safe */
+    await c.query('CREATE TABLE IF NOT EXISTS permission_modules(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,`key` VARCHAR(50) NOT NULL,description VARCHAR(255) DEFAULT NULL,sort_order INT DEFAULT 0)').catch(e=>console.error('pm create:',e.message));
+    await c.query('CREATE TABLE IF NOT EXISTS permission_groups(id INT AUTO_INCREMENT PRIMARY KEY,name VARCHAR(100) NOT NULL,role_key VARCHAR(50) DEFAULT NULL,description VARCHAR(255) DEFAULT NULL,color VARCHAR(20) DEFAULT \'#6b7280\',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(e=>console.error('pg create:',e.message));
+    await c.query('CREATE TABLE IF NOT EXISTS group_permissions(id INT AUTO_INCREMENT PRIMARY KEY,group_id INT NOT NULL,module_id INT NOT NULL,can_view TINYINT(1) DEFAULT 0,can_create TINYINT(1) DEFAULT 0,can_edit TINYINT(1) DEFAULT 0,can_delete TINYINT(1) DEFAULT 0)').catch(e=>console.error('gp create:',e.message));
+    /* Seed security data safely */
+    try{
+      /* Seed modules using INSERT IGNORE on key column */
+      const mods=[
+        [1,'Customers','customers',1],[2,'Contact Persons','contacts',2],
+        [3,'Quotes (CPQ)','quotes',3],[4,'Quote Follow-Up','followup',4],
+        [5,'Products','products',5],[6,'Suppliers','suppliers',6],
+        [7,'Delivery Notes','delivery_notes',7],[8,'BOQ','boq',8],
+        [9,'Attendance','attendance',9],[10,'Tasks','tasks',10],[11,'Admin Panel','admin',11]
+      ];
+      for(const[id,name,key,ord] of mods){
+        await c.query('INSERT INTO permission_modules(id,name,`key`,sort_order) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),sort_order=VALUES(sort_order)',[id,name,key,ord]).catch(()=>{});
       }
-    }
-
-    await c.query(`CREATE TABLE IF NOT EXISTS cpq_quote_items(
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      quote_id INT NOT NULL,
-      sort_order INT DEFAULT 0,
-      product_id INT DEFAULT NULL,
-      product_name VARCHAR(255) NOT NULL,
-      sku VARCHAR(100) DEFAULT NULL,
-      description TEXT DEFAULT NULL,
-      category VARCHAR(100) DEFAULT NULL,
-      supplier_id INT DEFAULT NULL,
-      supplier_name VARCHAR(255) DEFAULT NULL,
-      qty DECIMAL(10,3) DEFAULT 1,
-      unit VARCHAR(50) DEFAULT 'pcs',
-      cost DECIMAL(12,4) DEFAULT 0,
-      currency VARCHAR(10) DEFAULT 'AED',
-      markup_pct DECIMAL(7,2) DEFAULT 0,
-      selling_price DECIMAL(12,4) DEFAULT 0,
-      line_total DECIMAL(14,2) DEFAULT 0,
-      line_profit DECIMAL(14,2) DEFAULT 0,
-      FOREIGN KEY(quote_id) REFERENCES cpq_quotes(id) ON DELETE CASCADE,
-      FOREIGN KEY(product_id) REFERENCES cpq_products(id) ON DELETE SET NULL,
-      FOREIGN KEY(supplier_id) REFERENCES cpq_suppliers(id) ON DELETE SET NULL)`);
-
-    /* Migrations for quotations table */
-    await c.query("ALTER TABLE quotations ADD COLUMN version INT DEFAULT 1").catch(()=>{});
-    await c.query("ALTER TABLE quotations ADD COLUMN quotation_number_custom VARCHAR(100) DEFAULT NULL").catch(()=>{});
-    await c.query("ALTER TABLE quotations MODIFY COLUMN status ENUM('created','draft','sent','accepted','rejected') DEFAULT 'created'").catch(()=>{});
-
-
-    /* Migrations */
-    await c.query('ALTER TABLE attendance ADD COLUMN category_id INT DEFAULT NULL').catch(()=>{});
-    await c.query('ALTER TABLE attendance ADD COLUMN notes TEXT DEFAULT NULL').catch(()=>{});
-    await c.query('ALTER TABLE users ADD COLUMN schedule_id INT DEFAULT NULL').catch(()=>{});
-    await c.query(`ALTER TABLE users MODIFY COLUMN role ENUM('admin','supervisor','member') DEFAULT 'member'`).catch(()=>{});
-    await c.query(`ALTER TABLE users ADD COLUMN employee_category ENUM('office','field') DEFAULT 'office'`).catch(()=>{});
-    await c.query(`ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT FALSE`).catch(()=>{});
-    await c.query(`ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP NULL`).catch(()=>{});
-    await c.query(`ALTER TABLE notifications MODIFY COLUMN task_id INT DEFAULT NULL`).catch(()=>{});
-    await c.query(`ALTER TABLE notifications MODIFY COLUMN triggered_by_id INT DEFAULT NULL`).catch(()=>{});
-    await c.query(`ALTER TABLE notifications ADD COLUMN title VARCHAR(255) DEFAULT NULL`).catch(()=>{});
-    await c.query(`ALTER TABLE notifications ADD COLUMN message TEXT DEFAULT NULL`).catch(()=>{});
-    await c.query(`ALTER TABLE users ADD COLUMN last_login_ip VARCHAR(64) DEFAULT NULL`).catch(()=>{});
-    await c.query(`ALTER TABLE users ADD COLUMN department VARCHAR(100) DEFAULT ''`).catch(()=>{});
-    await c.query(`ALTER TABLE notifications MODIFY COLUMN type VARCHAR(50) DEFAULT 'assigned'`).catch(()=>{});
-    await c.query(`ALTER TABLE task_history CHANGE COLUMN changed_by_id user_id INT NOT NULL`).catch(()=>{});
-    await c.query(`ALTER TABLE task_history ADD COLUMN user_id INT NOT NULL DEFAULT 1`).catch(()=>{});
-    await c.query(`ALTER TABLE task_history MODIFY COLUMN action VARCHAR(100) NOT NULL`).catch(()=>{});
-    // attendance flag columns
-    await c.query(`ALTER TABLE attendance ADD COLUMN clock_in_flag ENUM('on_time','late','early') DEFAULT 'on_time'`).catch(()=>{});
-    await c.query(`ALTER TABLE attendance ADD COLUMN clock_out_flag ENUM('on_time','late','early') DEFAULT 'on_time'`).catch(()=>{});
-
-    const cols = ['comment','field','old_value','new_value'];
-    for(const col of cols){
-      const[rows]=await c.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_history' AND COLUMN_NAME=?`,[col]);
-      if(!rows.length) await c.query(`ALTER TABLE task_history ADD COLUMN ${col} ${col==='field'?'VARCHAR(50)':'TEXT'}`);
-    }
-
-    /* Seed */
-    const hash = await bcrypt.hash('Admin@1234',10);
-    await c.query(`INSERT IGNORE INTO users(username,email,password_hash,full_name,role,avatar_color) VALUES('admin','admin@company.com',?,'System Admin','admin','#7C5CFC')`,[hash]);
-    for(const[n,cl] of [['bug','#F87171'],['feature','#5B8AF0'],['design','#8B5CF6'],['backend','#FBBF24'],['frontend','#34D399'],['urgent','#F87171']])
-      await c.query('INSERT IGNORE INTO tags(name,color) VALUES(?,?)',[n,cl]);
-
+      /* Seed groups */
+      const groups=[[1,'Master Admin','admin','#dc2626'],[2,'Supervisor','supervisor','#7c3aed'],[3,'User','member','#0ea5e9']];
+      for(const[id,name,role_key,color] of groups){
+        await c.query('INSERT INTO permission_groups(id,name,role_key,color) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),role_key=VALUES(role_key),color=VALUES(color)',[id,name,role_key,color]).catch(()=>{});
+      }
+      /* Seed permissions for admin group (full access) */
+      await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT 1,id,1,1,1,1 FROM permission_modules ON DUPLICATE KEY UPDATE can_view=1,can_create=1,can_edit=1,can_delete=1').catch(()=>{});
+      /* Seed permissions for supervisor group (no delete) */
+      await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT 2,id,1,1,1,0 FROM permission_modules ON DUPLICATE KEY UPDATE can_view=1,can_create=1,can_edit=1').catch(()=>{});
+      /* Seed permissions for user group (view+create only) */
+      await c.query('INSERT INTO group_permissions(group_id,module_id,can_view,can_create,can_edit,can_delete) SELECT 3,id,1,1,0,0 FROM permission_modules ON DUPLICATE KEY UPDATE can_view=1,can_create=1').catch(()=>{});
+      console.log('[setup] Security tables seeded OK');
+    }catch(e){console.error('[setup] Security seed failed:',e.message);}
+  }catch(err){
+    console.error('setupDatabase error:',err);
+    throw err;
+  }finally{
     c.release();
-    console.log('✅ Database ready');
-  }catch(e){ console.error('DB setup error:',e.message); }
+  }
 }
 
 /* ══════════════════════════════════════
@@ -1906,13 +1709,26 @@ app.delete('/api/departments/:id', auth, adminOnly, wrap(async(req,res)=>{
 }));
 
 /* GET all groups with their permissions */
+app.get('/api/security/debug', auth, adminOnly, wrap(async(req,res)=>{
+  const results={};
+  try{const[r]=await pool.query('SELECT COUNT(*) as c FROM permission_groups');results.groups_count=r[0].c;}catch(e){results.groups_error=e.message;}
+  try{const[r]=await pool.query('SELECT COUNT(*) as c FROM permission_modules');results.modules_count=r[0].c;}catch(e){results.modules_error=e.message;}
+  try{const[r]=await pool.query('SELECT COUNT(*) as c FROM group_permissions');results.perms_count=r[0].c;}catch(e){results.perms_error=e.message;}
+  try{const[r]=await pool.query('SELECT id,name,role_key FROM permission_groups');results.groups=r;}catch(e){results.groups_fetch_error=e.message;}
+  res.json(results);
+}));
+
 app.get('/api/security/groups', auth, adminOnly, wrap(async(req,res)=>{
-  const[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id').catch(()=>[[]]);
-  const[perms]=await pool.query('SELECT * FROM group_permissions').catch(()=>[[]]);
-  const[modules]=await pool.query('SELECT * FROM permission_modules ORDER BY sort_order,name').catch(()=>[[]]);
-  /* Deduplicate in JS to avoid MySQL strict mode GROUP BY issues */
+  let groups=[],perms=[],modules=[];
+  try{[groups]=await pool.query('SELECT * FROM permission_groups ORDER BY id');}
+  catch(e){console.error('[security/groups] groups query failed:',e.message);}
+  try{[perms]=await pool.query('SELECT * FROM group_permissions');}
+  catch(e){console.error('[security/groups] perms query failed:',e.message);}
+  try{[modules]=await pool.query('SELECT * FROM permission_modules ORDER BY sort_order,name');}
+  catch(e){console.error('[security/groups] modules query failed:',e.message);}
   const seenG=new Set();const uniqGroups=(groups||[]).filter(g=>{if(seenG.has(g.name))return false;seenG.add(g.name);return true;});
   const seenM=new Set();const uniqModules=(modules||[]).filter(m=>{if(seenM.has(m.key))return false;seenM.add(m.key);return true;});
+  console.log(`[security/groups] returning ${uniqGroups.length} groups, ${uniqModules.length} modules`);
   res.json({groups:uniqGroups,perms:perms||[],modules:uniqModules});
 }));
 
