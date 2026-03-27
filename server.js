@@ -760,7 +760,11 @@ app.post('/api/auth/login', wrap(async(req,res)=>{
            || 'unknown';
   pool.query('UPDATE users SET last_login_at=NOW(),last_login_ip=? WHERE id=?',[ip,u.id]).catch(()=>{});
   pool.query('INSERT INTO activity_log(user_id,action,entity_type) VALUES(?,?,?)',[u.id,'login','user']).catch(()=>{});
-  res.json({token,user:{id:u.id,username:u.username,email:u.email,full_name:u.full_name,role:u.role,employee_category:u.employee_category||'office',department:u.department||'',avatar_color:u.avatar_color,permissions,must_change_password:u.must_change_password?true:false,last_login_at:u.last_login_at,last_login_ip:u.last_login_ip}});
+  /* Fetch group info */
+  let group_name=null,group_color=null;
+  if(u.group_id){const[[grp]]=await pool.query('SELECT name,color FROM permission_groups WHERE id=?',[u.group_id]).catch(()=>[[null]]);if(grp){group_name=grp.name;group_color=grp.color;}}
+  if(!group_name){const[[grp]]=await pool.query("SELECT name,color FROM permission_groups WHERE role_key=?",[u.role]).catch(()=>[[null]]);if(grp){group_name=grp.name;group_color=grp.color;}}
+  res.json({token,user:{id:u.id,username:u.username,email:u.email,full_name:u.full_name,role:u.role,group_id:u.group_id,group_name,group_color,department:u.department||'',avatar_color:u.avatar_color,permissions,must_change_password:u.must_change_password?true:false,last_login_at:u.last_login_at,last_login_ip:u.last_login_ip}});
 }));
 
 /* ══════════════════════════════════════
